@@ -1,0 +1,55 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+*.egg-info/
+dist/
+build/
+
+# Virtual environment
+.venv/
+venv/
+env/
+
+# Run results (CSV outputs)
+*.csv
+
+# Environment / secrets
+.env
+.env.*
+*.key
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+
+# Jupyter checkpoints
+.ipynb_checkpoints/
+
+# ML training artifacts
+catboost_info/
+
+# Generated images / charts
+*.png
+*.jpg
+*.jpeg
+*.svg
+
+# Database (runtime data)
+*.db
+*.sqlite
+*.sqlite3
+
+# Plans and notes
+plans/
+!README.md

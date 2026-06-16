@@ -1,0 +1,70 @@
+{
+  "_version": "v5.2",
+  "_description": "量化选股系统可调优参数 — 修改此文件后无需改动 .py 源码",
+  "ml_scoring": {
+    "top_n": 20,
+    "min_trading_days": 200,
+    "test_splits": 5,
+    "forecast_horizon_short": 21,
+    "forecast_horizon_long": 21,
+    "forecast_horizon_mom": 63,
+    "warmup": 30,
+    "adaptive_windows": [504, 756, 1008],
+    "cache_ttl_hours": 12,
+    "cache_refresh_hours": 4,
+    "score_formula": {
+      "rank_weight": 0.85,
+      "confidence_weight": 0.15
+    },
+    "direction_thresholds": {
+      "bullish": 0.25,
+      "bearish": -0.25
+    },
+    "momentum_fallback": {
+      "mom_21d_weight": 0.6,
+      "mom_63d_weight": 0.4,
+      "mom_score_offset": 0.5,
+      "r2_to_weight_multiplier": 0.5,
+      "weight_min": 0.1,
+      "weight_max": 0.5
+    },
+    "classification": {
+      "min_samples": 50,
+      "min_accuracy": 0.35
+    },
+    "confidence": {
+      "default_fallback": 0.3,
+      "min_confidence": 0.2
+    }
+  },
+  "cross_validate": {
+    "composite_weights": {
+      "ml": 0.50,
+      "factor": 0.30,
+      "sentiment": 0.20
+    },
+    "dynamic_weight_decay": 0.7,
+    "ml_weight_adj": {
+      "base": 0.7,
+      "confidence_scale": 0.3
+    },
+    "direction_bonus": {
+      "enabled": true,
+      "min_confidence": 0.3,
+      "multiplier": 1.1
+    },
+    "confidence_composition": {
+      "ml_confidence_weight": 0.4,
+      "has_news_base": 0.3,
+      "no_news_base": 0.1,
+      "consensus_weight": 0.3
+    },
+    "levels": {
+      "strong": 0.40,
+      "strong_min_confidence": 0.4,
+      "watch": 0.25,
+      "watch_min_confidence": 0.3,
+      "interest": 0.15
+    }
+  }
+}
