@@ -129,12 +129,12 @@ ADAPTIVE_WINDOWS = CFG["adaptive_windows"]
 # v5: 移除ETF, 补全股票池
 SECTOR_MAP = {
     "tech": {"AAPL","MSFT","GOOGL","AMZN","NVDA","META","AVGO","ORCL",
-             "AMD","INTC","QCOM","TXN","MU","ASML","ARM","TSM","PLTR"},
-    "finance": {"JPM","BAC","GS","MS","V","MA","BLK","SOFI","HOOD","COIN","MSTR"},
-    "consumer": {"WMT","COST","HD","LOW","PG","KO","PEP","MCD","SBUX","NKE"},
-    "healthcare": {"UNH","JNJ","PFE","ABBV","MRK","LLY","TMO"},
-    "energy": {"XOM","CVX"},
-    "industrial": {"CAT","GE","BA","HON"},
+             "AMD","QCOM","TSM"},
+    "finance": {"JPM","V","MA","GS","BLK"},
+    "consumer": {"WMT","COST","HD","PG","KO","PEP","MCD"},
+    "healthcare": {"UNH","JNJ","LLY","ABBV"},
+    "energy": {"XOM"},
+    "industrial": {"CAT","GE"},
     "hk_tech": {"0700.HK","9988.HK","9999.HK","1810.HK","3690.HK","9618.HK","1024.HK"},
     "hk_finance": {"0005.HK","1299.HK","0388.HK","0939.HK","3988.HK"},
     "hk_energy": {"0883.HK","0857.HK"},
@@ -144,26 +144,26 @@ SECTOR_MAP = {
 }
 
 MODELS_REGRESSION = {
-    "rf": "rf",  # 将在 train 时用 _build_reg_model 构建
-    "xgb": "xgb" if HAS_XGB else None,
-    "lgb": "lgb" if HAS_LGB else None,
+    "rf": "rf",
 }
 
 MODELS_CLASSIFICATION = {
     "rf": "rf",
-    "xgb": "xgb" if HAS_XGB else None,
-    "lgb": "lgb" if HAS_LGB else None,
 }
 
 # 美股 + 港股 (移除ETF)
 US_WATCHLIST = [
+    # 核心科技
     "AAPL","MSFT","GOOGL","AMZN","NVDA","META","AVGO","ORCL",
-    "AMD","INTC","QCOM","TXN","MU","ASML","ARM",
-    "JPM","BAC","GS","MS","V","MA","BLK",
-    "WMT","COST","HD","LOW","PG","KO","PEP","MCD","SBUX","NKE",
-    "UNH","JNJ","PFE","ABBV","MRK","LLY","TMO",
-    "XOM","CVX","CAT","GE","BA","HON",
-    "PLTR","SOFI","RDDT","HOOD","MSTR","COIN","TSM",
+    "AMD","QCOM","TSM",
+    # 金融
+    "JPM","V","MA","GS","BLK",
+    # 消费
+    "WMT","COST","HD","PG","KO","PEP","MCD",
+    # 医疗
+    "UNH","JNJ","LLY","ABBV",
+    # 能源/工业
+    "XOM","CAT","GE",
 ]
 
 HK_WATCHLIST = [
@@ -509,11 +509,11 @@ def train_model_walk_forward_v5(X, y_reg, y_cls, models_cfg, n_splits=TEST_SPLIT
         if cls_mask.sum() > CFG["classification"]["min_samples"]:
             cls_X_arr = X.values[cls_mask]
             cls_y_arr = y_cls.values[cls_mask]
-            # 三个分类器各自预测, 最后投票
-            cls_ensemble_preds = np.zeros((len(cls_y_arr), 3), dtype=np.float32)
+            cls_model_names = [name for name, cfg in MODELS_CLASSIFICATION.items() if cfg is not None]
+            cls_ensemble_preds = np.zeros((len(cls_y_arr), len(cls_model_names)), dtype=np.float32)
             cls_acc_models = []
 
-            for cls_i, cls_name in enumerate(["rf", "xgb", "lgb"]):
+            for cls_i, cls_name in enumerate(cls_model_names):
                 try:
                     cls_m = _build_cls_model(cls_name, n_samples)
                     if cls_m is None:
@@ -578,6 +578,54 @@ def train_model_walk_forward_v5(X, y_reg, y_cls, models_cfg, n_splits=TEST_SPLIT
 # ═══════════════════════════════════════
 # P0.1: 个股评分 v5 (Rank一致性)
 # ═══════════════════════════════════════
+
+def _momentum_direction_fallback(close_series, df_used):
+    """动量方向兜底: 当分类器无信号时, 用EMA平滑动量 + 短期趋势判断方向
+    
+    返回: "看涨" / "看跌" / "震荡"
+    """
+    try:
+        closes = close_series.values if hasattr(close_series, 'values') else close_series
+        # EMA趋势: 21d和63d EMA方向一致
+        ema_21 = close_series.ewm(span=21).mean()
+        ema_63 = close_series.ewm(span=63).mean()
+        ema_trend = (ema_21.iloc[-1] > ema_21.iloc[-22]) and (ema_63.iloc[-1] > ema_63.iloc[-64])
+        ema_trend_down = (ema_21.iloc[-1] < ema_21.iloc[-22]) and (ema_63.iloc[-1] < ema_63.iloc[-64])
+        
+        # 短期动量大 / 小
+        short_mom = (close_series.iloc[-1] / close_series.iloc[-6] - 1) * 100 if len(close_series) >= 6 else 0
+        
+        bullish_count = 0
+        bearish_count = 0
+        
+        if ema_trend:
+            bullish_count += 2
+        if ema_trend_down:
+            bearish_count += 2
+        if short_mom > 2:
+            bullish_count += 1
+        elif short_mom < -2:
+            bearish_count += 1
+        
+        # 近5日K线: 阳线多还是阴线多
+        if len(closes) >= 6:
+            daily_ret = pd.Series(closes).pct_change()
+            up_days = (daily_ret.tail(5) > 0).sum()
+            down_days = (daily_ret.tail(5) < 0).sum()
+            if up_days >= 4:
+                bullish_count += 1
+            elif down_days >= 4:
+                bearish_count += 1
+        
+        if bullish_count >= 2 and bullish_count > bearish_count:
+            return "看涨"
+        elif bearish_count >= 2 and bearish_count > bullish_count:
+            return "看跌"
+        else:
+            return "震荡"
+    except:
+        return "震荡"
+
 def score_stock_v5(ticker, macro_data=None, period="2y", force_refresh=False):
     """v5.2 个股评分: Rank一致性评分 + 双轨预测 + 自适应窗口"""
     df = get_cached_data(ticker, period=period, force_refresh=force_refresh)
@@ -665,16 +713,16 @@ def score_stock_v5(ticker, macro_data=None, period="2y", force_refresh=False):
     latest_rank = float(rank_df.iloc[-1].mean())  # 各模型排名均值
     
     # ─── P1b: EMA平滑动量兜底 ───
+    closes = df_used["Close"].values.astype(float)
+    close_series = pd.Series(closes)
+    ema_21 = close_series.ewm(span=21).mean()
+    ema_63 = close_series.ewm(span=63).mean()
+    mom_21d_val = (ema_21.iloc[-1] / ema_21.iloc[-22] - 1) if len(ema_21) >= 22 else 0
+    mom_63d_val = (ema_63.iloc[-1] / ema_63.iloc[-64] - 1) if len(ema_63) >= 64 else 0
+    
     avg_r2 = np.mean([results[n]["reg_r2"] for n in model_names])
     if avg_r2 < 0:
-        closes = df_used["Close"].values.astype(float)
-        close_series = pd.Series(closes)
-        # 用EMA平滑价格计算动量, 消除单点噪声
-        ema_21 = close_series.ewm(span=21).mean()
-        ema_63 = close_series.ewm(span=63).mean()
-        mom_21d = (ema_21.iloc[-1] / ema_21.iloc[-22] - 1) if len(ema_21) >= 22 else 0
-        mom_63d = (ema_63.iloc[-1] / ema_63.iloc[-64] - 1) if len(ema_63) >= 64 else 0
-        mom_score = max(0, min(1, (mom_21d * CFG["momentum_fallback"]["mom_21d_weight"] + mom_63d * CFG["momentum_fallback"]["mom_63d_weight"] + CFG["momentum_fallback"]["mom_score_offset"])))
+        mom_score = max(0, min(1, (mom_21d_val * CFG["momentum_fallback"]["mom_21d_weight"] + mom_63d_val * CFG["momentum_fallback"]["mom_63d_weight"] + CFG["momentum_fallback"]["mom_score_offset"])))
         mom_weight = min(max(-avg_r2 * CFG["momentum_fallback"]["r2_to_weight_multiplier"], CFG["momentum_fallback"]["weight_min"]), CFG["momentum_fallback"]["weight_max"])
         final_rank = latest_rank * (1 - mom_weight) + mom_score * mom_weight
     else:
@@ -688,7 +736,7 @@ def score_stock_v5(ticker, macro_data=None, period="2y", force_refresh=False):
         ensemble_dirs = []
         # 从各模型的分类结果获取方向信号
         for name in model_names:
-            if results[name]["cls_model"] is not None and results[name]["cls_acc"] > 0.35:
+            if results[name]["cls_model"] is not None and results[name]["cls_acc"] > CFG["classification"]["min_accuracy"]:
                 # 分类模型是ensemble数组, 用最新值
                 if isinstance(results[name]["cls_model"], np.ndarray):
                     cls_pred = int(np.sign(np.mean(results[name]["cls_model"][-3:]) or 0))
@@ -711,10 +759,15 @@ def score_stock_v5(ticker, macro_data=None, period="2y", force_refresh=False):
                 direction = "看跌"
             else:
                 direction = "震荡"
+            direction_source = "cls_ensemble"
         else:
-            direction = "震荡"
+            # 动量方向兜底: 分类器无信号时, 用EMA平滑动量判断方向
+            fallback_direction = _momentum_direction_fallback(close_series, df_used)
+            direction = fallback_direction
+            direction_source = "momentum_fallback"
     else:
         direction = "震荡"
+        direction_source = "no_model"
 
     # 最新预测收益
     latest_pred_reg = float(rank_df.iloc[-1].mean())  # 用排名百分位表示
@@ -741,6 +794,7 @@ def score_stock_v5(ticker, macro_data=None, period="2y", force_refresh=False):
         "models_r2": {n: round(results[n]["reg_r2"], 4) for n in model_names},
         "models_consensus": round(confidence, 4),
         "sector": get_ticker_sector(ticker),
+        "direction_source": direction_source,
     }
 
 

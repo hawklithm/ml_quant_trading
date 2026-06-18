@@ -4,12 +4,16 @@
   "ml_scoring": {
     "top_n": 20,
     "min_trading_days": 200,
-    "test_splits": 5,
+    "test_splits": 2,
     "forecast_horizon_short": 21,
     "forecast_horizon_long": 21,
     "forecast_horizon_mom": 63,
     "warmup": 30,
-    "adaptive_windows": [504, 756, 1008],
+    "adaptive_windows": [
+      504,
+      756,
+      1008
+    ],
     "cache_ttl_hours": 12,
     "cache_refresh_hours": 4,
     "score_formula": {
@@ -17,8 +21,8 @@
       "confidence_weight": 0.15
     },
     "direction_thresholds": {
-      "bullish": 0.25,
-      "bearish": -0.25
+      "bullish": 0.15,
+      "bearish": -0.15
     },
     "momentum_fallback": {
       "mom_21d_weight": 0.6,
@@ -29,8 +33,8 @@
       "weight_max": 0.5
     },
     "classification": {
-      "min_samples": 50,
-      "min_accuracy": 0.35
+      "min_samples": 20,
+      "min_accuracy": 0.2
     },
     "confidence": {
       "default_fallback": 0.3,
@@ -39,9 +43,9 @@
   },
   "cross_validate": {
     "composite_weights": {
-      "ml": 0.50,
-      "factor": 0.30,
-      "sentiment": 0.20
+      "ml": 0.5,
+      "factor": 0.3,
+      "sentiment": 0.2
     },
     "dynamic_weight_decay": 0.7,
     "ml_weight_adj": {
@@ -60,7 +64,7 @@
       "consensus_weight": 0.3
     },
     "levels": {
-      "strong": 0.40,
+      "strong": 0.4,
       "strong_min_confidence": 0.4,
       "watch": 0.25,
       "watch_min_confidence": 0.3,

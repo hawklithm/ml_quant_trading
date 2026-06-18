@@ -39,21 +39,31 @@ from datetime import datetime, timedelta
 warnings.filterwarnings("ignore")
 
 # ═══════════════════════════════════════
+# 从 v5_config.json 加载参数
+# ═══════════════════════════════════════
+_CONFIG_PATH = os.path.join(os.path.dirname(__file__), "v5_config.json")
+with open(_CONFIG_PATH) as f:
+    _CONFIG = json.load(f)
+
+_ML = _CONFIG.get("ml_scoring", {})
+_CV = _CONFIG.get("cross_validate", {})
+
+# ═══════════════════════════════════════
 # 配置
 # ═══════════════════════════════════════
 CACHE_DIR = os.path.expanduser("~/.cache/hermes-quant")
 os.makedirs(CACHE_DIR, exist_ok=True)
 
 # 权重配置 (初始值, 动态调整)
-WEIGHT_ML = 0.50        # ML 模型权重
-WEIGHT_FACTOR = 0.30    # 多因子权重
-WEIGHT_SENTIMENT = 0.20 # 新闻情绪权重
-DYNAMIC_WEIGHT_DECAY = 0.7  # 动态权重的平滑系数
+WEIGHT_ML = _CV["composite_weights"]["ml"]
+WEIGHT_FACTOR = _CV["composite_weights"]["factor"]
+WEIGHT_SENTIMENT = _CV["composite_weights"]["sentiment"]
+DYNAMIC_WEIGHT_DECAY = _CV["dynamic_weight_decay"]
 
 # 置信度分级阈值
-LEVEL_STRONG = 0.40     # 强烈关注
-LEVEL_WATCH = 0.25      # 值得跟踪
-LEVEL_INTEREST = 0.15   # 值得关注
+LEVEL_STRONG = _CV["levels"]["strong"]
+LEVEL_WATCH = _CV["levels"]["watch"]
+LEVEL_INTEREST = _CV["levels"]["interest"]
 
 # 美股关注列表
 US_WATCHLIST = [
@@ -278,10 +288,12 @@ def compute_composite(ml_data, factor_data, sentiment_data, tickers, dynamic_wei
         has_news = st.get("news_count", 0) > 0
 
         # 可信度调整 (v5: 增加ML方向的权重当方向明确时)
-        ml_weight_adj = weight_ml * (0.7 + 0.3 * ml_confidence)
+        adj = _CV["ml_weight_adj"]
+        ml_weight_adj = weight_ml * (adj["base"] + adj["confidence_scale"] * ml_confidence)
+        db = _CV["direction_bonus"]
         direction_bonus = ml.get("ml_direction", "") in ("看涨", "看跌")
-        if direction_bonus and ml_confidence > 0.3:
-            ml_weight_adj *= 1.1
+        if db["enabled"] and direction_bonus and ml_confidence > db["min_confidence"]:
+            ml_weight_adj *= db["multiplier"]
         
         factor_weight_adj = weight_factor
         sentiment_weight_adj = weight_sentiment * (1.0 if has_news else 0.3)
@@ -301,19 +313,21 @@ def compute_composite(ml_data, factor_data, sentiment_data, tickers, dynamic_wei
         consensus = 1.0 - np.std(scores_vec)
 
         # 置信度计算
+        cc = _CV["confidence_composition"]
         confidence = min(
-            ml_confidence * 0.4 +
-            (0.3 if has_news else 0.1) +
-            0.3 * consensus,
+            ml_confidence * cc["ml_confidence_weight"] +
+            (cc["has_news_base"] if has_news else cc["no_news_base"]) +
+            cc["consensus_weight"] * consensus,
             1.0
         )
 
         # 等级
-        if composite_score >= LEVEL_STRONG and confidence >= 0.4:
+        lv = _CV["levels"]
+        if composite_score >= lv["strong"] and confidence >= lv["strong_min_confidence"]:
             level = "🟢 强烈关注"
-        elif composite_score >= LEVEL_WATCH and confidence >= 0.3:
+        elif composite_score >= lv["watch"] and confidence >= lv["watch_min_confidence"]:
             level = "🟡 值得跟踪"
-        elif composite_score >= LEVEL_INTEREST:
+        elif composite_score >= lv["interest"]:
             level = "🔵 值得关注"
         else:
             level = "⚪ 一般"
