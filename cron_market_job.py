@@ -14,7 +14,7 @@ cron_market_job.py — ML量化选股定时任务脚本
   python cron_market_job.py --market US --mode post
 """
 
-import sys, os, json, time, re
+import sys, os, json, time, re, numpy as np
 from datetime import datetime, timedelta
 
 # 添加当前目录到路径
@@ -69,11 +69,13 @@ def load_v5_module():
     from ml_optimized_picker_v5 import US_WATCHLIST, HK_WATCHLIST
     from ml_optimized_picker_v5 import score_stock_v5, get_macro_data
     from ml_optimized_picker_v5 import run_ml_picking_v5, print_report_v5, save_results_v5
+    from ml_optimized_picker_v5 import get_cached_data  # 复盘复用缓存
     return {
         "US_WATCHLIST": US_WATCHLIST,
         "HK_WATCHLIST": HK_WATCHLIST,
         "score_stock_v5": score_stock_v5,
         "get_macro_data": get_macro_data,
+        "get_cached_data": get_cached_data,
         "run_ml_picking_v5": run_ml_picking_v5,
         "print_report_v5": print_report_v5,
         "save_results_v5": save_results_v5,
@@ -110,14 +112,9 @@ def _get_market_date(market, now=None):
     if market == "HK":
         return now.strftime("%Y-%m-%d")
     else:
-        # 美股: CST 04:30对应前一个ET交易日结束
-        # 用美东时间判断
-        et_hour = now.hour - 12  # ET = CST - 1 (夏令时)
-        if et_hour < 0:
-            et_hour += 24
-        et_date = now
-        if et_hour < 8:  # ET早于08:00 → 前一个交易日
-            et_date = now - timedelta(days=1)
+        # 美股: CST → EDT (夏令时差12小时)
+        # CST 20:00 = EDT 08:00, CST 04:30 = EDT 16:30(前一天)
+        et_date = now - timedelta(hours=12)
         return et_date.strftime("%Y-%m-%d")
 
 
@@ -139,7 +136,7 @@ def _is_us_trading_day(d=None):
 # ═══════════════════════════════════════
 # Pre-Market: 开市前选股预测
 # ══════════════════════════════��════════
-def run_pre_market(market):
+def run_pre_market(market, sentiment=False):
     """开市前运行选股预测，保存结果到状态文件"""
     v5 = load_v5_module()
     state = load_state(market)
@@ -220,6 +217,57 @@ def run_pre_market(market):
         directions[p["direction"]] += 1
     dir_str = " | ".join(f"{k}: {v}只" for k, v in sorted(directions.items()))
     print(f"\n  方向分布: {dir_str}")
+
+    # ─── 异常事件检测 (--sentiment) ───
+    if sentiment and predictions:
+        print(f"\n  📰 加载新闻情绪 + 异常事件检测...")
+        try:
+            from finbert_sentiment import build_sentiment_factors, sentiment_boost
+
+            all_tickers = [p["ticker"] for p in predictions]
+            sentiment_factors = build_sentiment_factors(all_tickers)
+
+            event_stocks = []
+            for p in predictions:
+                t = p["ticker"]
+                sf = sentiment_factors.get(t, {})
+                if sf and sf.get("news_count", 0) > 0:
+                    original = p["score"]
+                    fused, adj, evt_adj = sentiment_boost(original, sf)
+                    p["score"] = fused
+                    p["sentiment_adj"] = adj
+                    p["event_adj"] = evt_adj
+                    if sf.get("events"):
+                        event_stocks.append((t, sf["event_labels"], sf.get("event_discount", 1.0)))
+
+            predictions.sort(key=lambda x: x["score"], reverse=True)
+
+            if event_stocks:
+                print(f"\n  ⚠️  异常事件预警 ({len(event_stocks)} 只):")
+                for t, labels, discount in event_stocks:
+                    print(f"    🔴 {t}: {' + '.join(labels)} (折扣 {discount:.3f})")
+
+            # 重新保存 state（包含情绪修正后的评分）
+            save_state(market, state)
+            print(f"  ✅ 情绪融合完成 ({len(all_tickers)} 只)")
+        except ImportError:
+            print(f"  ⚠️  finbert_sentiment.py 未找到，跳过情绪融合")
+        except Exception as e:
+            print(f"  ⚠️  情绪融合失败: {e}")
+
+    # ─── 数据质量报告 ───
+    r2s = [p["walk_forward_r2"] for p in predictions]
+    avg_r2 = np.mean(r2s)
+    neg_r2 = sum(1 for r in r2s if r < 0)
+    price_missing = [p["ticker"] for p in predictions if not p.get("price") or p["price"] <= 0]
+    print(f"\n  📊 数据质量: 平均R²={avg_r2:.2f} | 负R²={neg_r2}/{len(predictions)}")
+    if price_missing:
+        print(f"     ⚠️  收盘价缺失(回退到前一日): {', '.join(price_missing[:5])}")
+    if avg_r2 < -0.1:
+        print(f"     ⚠️  R²偏负（市场结构变化），已启用动量兜底保持排序稳定性")
+    if len(price_missing) == 0:
+        print(f"     ✅ 全部30只价格正常")
+
     print(f"  ✅ {label}开市前预测完成!")
 
 
@@ -228,7 +276,6 @@ def run_pre_market(market):
 # ═══════════════════════════════════════
 def run_post_market(market):
     """收市后复盘：对比预测 vs 实际，分析差异，自动优化"""
-    import yfinance as yf
     import pandas as pd
     from scipy.stats import spearmanr
     import numpy as np
@@ -253,14 +300,18 @@ def run_post_market(market):
         print("  ⚠️ 预测记录为空，跳过复盘")
         return
 
+    # 复用缓存: 用 get_cached_data 替代直接 yf.download, 减少YF调用
+    v5 = load_v5_module()
+    get_cached = v5["get_cached_data"]
+
     # 下载今日收盘数据对比
     compare = []
     errors = []
     for i, p in enumerate(predictions):
         ticker = p["ticker"]
         try:
-            df = yf.download(ticker, period="5d", auto_adjust=True, progress=False)
-            if df.empty:
+            df = get_cached(ticker, period="2y", force_refresh=False)
+            if df.empty or len(df) < 2:
                 errors.append(ticker)
                 continue
             if isinstance(df.columns, pd.MultiIndex):
@@ -619,10 +670,11 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="ML量化选股 cron job")
     parser.add_argument("--market", required=True, choices=["HK", "US"])
     parser.add_argument("--mode", required=True, choices=["pre", "post"])
+    parser.add_argument("--sentiment", action="store_true", help="融合新闻情绪因子和异常事件检测")
     args = parser.parse_args()
 
     if args.mode == "pre":
-        run_pre_market(args.market)
+        run_pre_market(args.market, sentiment=args.sentiment)
     else:
         result = run_post_market(args.market)
         if result:

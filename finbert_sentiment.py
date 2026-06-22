@@ -27,12 +27,14 @@ import json
 import os
 import re
 import sys
+import time
 from datetime import datetime
 
 import numpy as np
 import pandas as pd
 import requests
 from xml.etree import ElementTree
+from openai import OpenAI
 
 # ═══════════════════════════════════════
 # 配置
@@ -42,6 +44,11 @@ MODEL_CACHE_DIR = os.path.join(CACHE_DIR, "finbert_model")
 NEWS_TTL_HOURS = 6
 MAX_NEWS_PER_TICKER = 10
 FINBERT_MODEL_NAME = "ProsusAI/finbert"
+
+# LLM 分析配置
+LLM_MODEL = "DeepSeek-V4-Flash"
+LLM_TIMEOUT = 60  # 单批次超时
+LLM_RETRY = 2     # 失败重试次数
 
 # 情绪关键词词典 — 用于 fallback 和二次验证
 BULLISH_KEYWORDS = [
@@ -74,6 +81,59 @@ TOPIC_PATTERNS = {
     "partnership": r"(partner|collaboration|alliance|joint venture|teams? with)",
     "AI": r"(AI|artificial intelligence|machine learning|deep learning|LLM|GPT)",
     "macro": r"(interest rate|inflation|Fed|recession|GDP|employment|tariff|trade)",
+}
+
+# ═══════════════════════════════════════
+# 异常事件检测模式 — 用于事件驱动做空/风险预警
+# ═══════════════════════════════════════
+EVENT_PATTERNS = {
+    "layoff": (
+        r"(layoff|lay off|firing|downsize|severance|workforce\s*reduction|"
+        r"job\s*cut|大规模裁员|优化人员|人员优化|缩减人员|人事调整|减员)"
+    ),
+    "profit_warning": (
+        r"(profit\s*warning|guidance\s*cut|revenue\s*warning|earnings\s*warning|"
+        r"pre.announce|预警|业绩预警|利润预警|盈警|盈利预警)"
+    ),
+    "executive_change": (
+        r"(CEO\s+(resign|step\s*down|depart|fir(e|ed)|quit|outsted|remov(e|ed))|"
+        r"CFO\s+(resign|step\s*down|depart|fir(e|ed)|quit)|"
+        r"executive\s*departure|高管变动|创始人\s*(离职|辞职)|管理层\s*(地震|变动)|"
+        r"财务总监\s*(离职|辞职)|董秘\s*(离职|辞职))"
+    ),
+    "debt_crisis": (
+        r"(debt\s*crisis|default|bankruptcy|insolvent|covenant\s*breach|"
+        r"债务违约|债券违约|资不抵债|破产|债务危机|无力偿还|兑付困难)"
+    ),
+    "short_report": (
+        r"(short\s*seller|short\s*report|做空报告|做空机构|"
+        r"Citron|Muddy\s*Water|Blue\s*Orca|Hindenburg|浑水|香橼|哥谭)"
+    ),
+    "regulatory_crackdown": (
+        r"(regulatory\s*crackdown|antitrust|反垄断|约谈|立案调查|"
+        r"处罚|罚款|suspended\s*trading|stricter\s*regulation|"
+        r"监管\s*(约谈|调查|处罚|罚款|立案)|立案\s*调查)"
+    ),
+    "product_recall": (
+        r"(recall|product\s*defect|召回|质量事故|安全事故|"
+        r"产品\s*(召回|缺陷|问题)|安全\s*(事故|隐患))"
+    ),
+    "delisting_risk": (
+        r"(delist|退市|ST|\*ST|特别处理|suspended|摘牌|"
+        r"暂停\s*上市|终止\s*上市)"
+    ),
+}
+
+# 事件严重性映射 (0~1, 越小越严重, 用于 event_penalty 做乘数)
+EVENT_SEVERITY = {
+    "layoff": 0.80,
+    "profit_warning": 0.70,
+    "executive_change": 0.85,
+    "debt_crisis": 0.50,
+    "short_report": 0.75,
+    "regulatory_crackdown": 0.75,
+    "product_recall": 0.85,
+    "delisting_risk": 0.30,
 }
 
 
@@ -268,6 +328,207 @@ def fetch_batch_news(tickers):
 
 
 # ═══════════════════════════════════════
+# 3a. LLM 情感分析（DeepSeek-V4-Flash，每只股票一批调用）
+# ═══════════════════════════════════════
+def _get_llm_client():
+    """从 Hermes 配置获取 API 密钥，初始化 OpenAI 客户端
+
+    多策略读取（按优先级）：
+    1. auth.json (Hermes 凭据池)
+    2. config.yaml 直接解析
+    3. 环境变量
+    """
+    import json as _json
+
+    base_url = ""
+    api_key = ""
+
+    try:
+        # 策略1: auth.json — 找 custom:liantong 或 custom:aigw 的 access_token
+        auth_path = os.path.expanduser("~/.hermes/auth.json")
+        if os.path.exists(auth_path):
+            with open(auth_path) as f:
+                auth_data = _json.load(f)
+            cp = auth_data.get("credential_pool", {})
+            for provider_key in ["custom:liantong", "custom:aigw-gzgy2.cucloud.cn:8443"]:
+                for cred in cp.get(provider_key, []):
+                    ak = cred.get("access_token", "")
+                    bu = cred.get("base_url", "")
+                    if ak and ak != "***" and bu:
+                        api_key = ak
+                        base_url = bu
+                        break
+                if api_key:
+                    break
+    except Exception:
+        pass
+
+    # 策略2: config.yaml 手动解析
+    if not api_key or not base_url:
+        try:
+            config_path = os.path.expanduser("~/.hermes/config.yaml")
+            if os.path.exists(config_path):
+                with open(config_path) as f:
+                    raw = f.read()
+                for line in raw.split("\n"):
+                    # model 层的 api_key/base_url
+                    stripped = line.strip()
+                    if stripped.startswith("api_key:") and "auxiliary" not in line and "custom_providers" not in line:
+                        v = stripped.split(":", 1)[1].strip().strip('"').strip("'")
+                        if v and v != "***":
+                            api_key = api_key or v
+                    if stripped.startswith("base_url:") and "auxiliary" not in line and "custom_providers" not in line:
+                        v = stripped.split(":", 1)[1].strip().strip('"').strip("'")
+                        if v:
+                            base_url = base_url or v
+        except Exception:
+            pass
+
+    if not api_key or not base_url:
+        return None
+
+    try:
+        # OpenAI/httpx 受 ALL_PROXY 环境变量影响，需要临时清除
+        for p in ("HTTP_PROXY", "HTTPS_PROXY", "http_proxy", "https_proxy",
+                  "ALL_PROXY", "all_proxy"):
+            os.environ.pop(p, None)
+        return OpenAI(base_url=base_url, api_key=api_key, timeout=LLM_TIMEOUT)
+    except Exception:
+        return None
+
+
+EVENT_LABELS = {
+    "layoff": "裁员",
+    "profit_warning": "业绩预警",
+    "executive_change": "高管变动",
+    "debt_crisis": "债务危机",
+    "short_report": "做空报告",
+    "regulatory_crackdown": "监管整顿",
+    "product_recall": "产品召回",
+    "delisting_risk": "退市风险",
+}
+
+
+LLM_SYSTEM_PROMPT = """你是一位金融新闻分析师。分析给定股票的多条新闻，返回JSON格式分析结果。
+
+你必须严格返回以下JSON格式（不要加markdown标记）：
+{
+  "sentiment_score": 浮点数 -1~+1,
+  "sentiment_reason": "简短判断原因",
+  "events": [
+    {
+      "event_type": "layoff|profit_warning|executive_change|debt_crisis|short_report|regulatory_crackdown|product_recall|delisting_risk",
+      "confidence": 浮点数 0~1,
+      "source_news_indices": [新闻序号列表]
+    }
+  ]
+}
+
+判断标准：
+- sentiment_score: 综合所有新闻的整体情绪。-1=极度负面, +1=极度正面, 0=中性。
+  如果有多条偏多新闻+中性新闻，整体偏多但不会极端。
+  如果有多条负面事件（裁员、预警），打分要相应降低。
+
+事件检测（event_type）：
+- layoff: 裁员、人员优化、减员
+- profit_warning: 业绩预警、利润预警、盈利预警、guidance cut
+- executive_change: CEO/CFO/高管离职、管理层变动
+- debt_crisis: 债务危机、违约、破产、资不抵债
+- short_report: 做空报告、做空机构
+- regulatory_crackdown: 监管约谈、反垄断、立案调查、罚款
+- product_recall: 产品召回、质量事故
+- delisting_risk: 退市风险、暂停上市
+
+注意：
+- 只有确实发生了异常事件才标events，日常新闻不要误报
+- 同一事件类型在多条新闻中出现，只report一次，confidence取最高那个
+- confidence<0.6的事件不要report（避免假阳性）
+- 没有异常事件时events返回空列表[]
+"""
+
+
+def llm_sentiment_by_ticker(ticker, news_list):
+    """用 DeepSeek-V4-Flash 对单只股票的多条新闻进行批量语义分析
+
+    每只股票一次 API 调用，返回结构化情绪因子。
+    失败时返回 None，由调用方 fallback 到关键词方法。
+    """
+    if not news_list:
+        return None
+
+    client = _get_llm_client()
+    if client is None:
+        return None
+
+    # 构造新闻文本
+    news_lines = []
+    for i, n in enumerate(news_list):
+        news_lines.append(
+            f"[{i+1}] 标题: {n['title']}\n    摘要: {n['summary']}"
+        )
+    news_text = "\n".join(news_lines)
+
+    user_prompt = f"""股票代码: {ticker}
+新闻数量: {len(news_list)}
+
+请分析以下所有新闻，返回JSON：
+
+{news_text}"""
+
+    for attempt in range(LLM_RETRY + 1):
+        try:
+            resp = client.chat.completions.create(
+                model=LLM_MODEL,
+                messages=[
+                    {"role": "system", "content": LLM_SYSTEM_PROMPT},
+                    {"role": "user", "content": user_prompt},
+                ],
+                temperature=0.1,
+                max_tokens=1024,
+            )
+            msg = resp.choices[0].message
+            # 某些 API 网关把输出放在 reasoning 而不是 content
+            content = (msg.content or msg.reasoning or "").strip()
+
+            # 解析 JSON（处理可能的 markdown 包裹）
+            if content.startswith("```"):
+                content = re.sub(r"^```(?:json)?\s*", "", content)
+                content = re.sub(r"\s*```$", "", content)
+            result = json.loads(content)
+
+            # 验证基本结构
+            assert isinstance(result.get("sentiment_score"), (int, float))
+            assert -1.0 <= result["sentiment_score"] <= 1.0
+
+            # 规范化事件列表
+            events = result.get("events", [])
+            valid_events = []
+            for evt in events:
+                et = evt.get("event_type", "")
+                conf = float(evt.get("confidence", 0))
+                if et in EVENT_LABELS and conf >= 0.6:
+                    valid_events.append({
+                        "event_type": et,
+                        "confidence": conf,
+                    })
+
+            return {
+                "sentiment_score": round(float(result["sentiment_score"]), 4),
+                "sentiment_reason": result.get("sentiment_reason", ""),
+                "events": valid_events,
+            }
+
+        except Exception as e:
+            if attempt < LLM_RETRY:
+                time.sleep(1)
+                continue
+            # 最后一次失败，记录但返回 None
+            return None
+
+    return None
+
+
+# ═══════════════════════════════════════
 # 3. 情感分析核心
 # ═══════════════════════════════════════
 def detect_topics(title, summary):
@@ -278,6 +539,41 @@ def detect_topics(title, summary):
         if re.search(pattern, text):
             topics.append(topic)
     return topics
+
+
+def detect_events(title, summary):
+    """检测异常事件类型（裁员/业绩预警/高管变动等）
+
+    返回: list[dict], 每项 {"event_type": str, "severity": float}
+    """
+    text = (title + " " + summary).lower()
+    events = []
+    for evt, pattern in EVENT_PATTERNS.items():
+        if re.search(pattern, text):
+            events.append({
+                "event_type": evt,
+                "severity": EVENT_SEVERITY.get(evt, 1.0),
+            })
+    return events
+
+
+def compute_event_discount(events, discount_base=0.85, min_keep=0.10):
+    """根据检测到的异常事件计算评分折扣系数
+
+    多条严重事件叠加: 取最严重的那个 × (discount_base)^(后续事件数)
+    例如: delisting_risk(0.30) + profit_warning(0.70) = 0.30 × 0.85 = 0.255
+    """
+    if not events:
+        return 1.0
+    
+    sorted_events = sorted(events, key=lambda e: e["severity"])
+    multiplier = 1.0
+    for i, evt in enumerate(sorted_events):
+        if i == 0:
+            multiplier = evt["severity"]
+        else:
+            multiplier *= discount_base
+    return max(multiplier, min_keep)  # 最低保留min_keep%
 
 
 def keyword_sentiment(title, summary):
@@ -346,7 +642,9 @@ def finbert_sentiment(title, summary):
 
 
 def deep_sentiment(ticker, news_list):
-    """完整情绪分析（FinBERT + 关键词混合，聚合因子）
+    """完整情绪分析（DeepSeek LLM 语义分析 + 关键词兜底）
+
+    优先用 LLM 做每只股票一批的语义分析，失败时回退到关键词方法。
 
     返回: dict (与 news_sentiment.py 格式一致)
     """
@@ -361,11 +659,69 @@ def deep_sentiment(ticker, news_list):
             "recent_headlines": [],
             "recent_direction": 0.0,
             "method": "none",
+            "events": [],
+            "event_discount": 1.0,
+            "event_labels": [],
         }
 
+    # ─── 优先用 LLM 做语义分析 ───
+    llm_result = llm_sentiment_by_ticker(ticker, news_list)
+
+    if llm_result is not None:
+        # LLM 成功 — 用 LLM 的情绪分 + 事件检测
+        llm_score = llm_result["sentiment_score"]
+        events = llm_result["events"]
+
+        # 同时用关键词方法获取话题（LLM 不分析话题，关键词快速补充）
+        all_topics = []
+        for n in news_list:
+            topics = detect_topics(n["title"], n["summary"])
+            all_topics.extend(topics)
+
+        topic_counts = {}
+        for t in all_topics:
+            topic_counts[t] = topic_counts.get(t, 0) + 1
+        hot_topics = sorted(topic_counts.items(), key=lambda x: -x[1])[:5]
+
+        # 事件折扣
+        event_severity = {
+            "layoff": 0.80, "profit_warning": 0.70,
+            "executive_change": 0.85, "debt_crisis": 0.50,
+            "short_report": 0.75, "regulatory_crackdown": 0.75,
+            "product_recall": 0.85, "delisting_risk": 0.30,
+        }
+        unique_events = []
+        for evt in events:
+            unique_events.append({
+                "event_type": evt["event_type"],
+                "count": 1,
+                "severity": event_severity.get(evt["event_type"], 1.0),
+            })
+        event_discount = compute_event_discount(unique_events) if unique_events else 1.0
+
+        # 头几条新闻用于展示
+        headlines = [n["title"] for n in news_list[:5]]
+
+        return {
+            "sentiment_score": llm_score,
+            "sentiment_consistency": 0.5,  # LLM 不输出一致性，给默认值
+            "sentiment_urgency": min(len(news_list) / 10, 1.0) * (1.0 + abs(llm_score)),
+            "news_count": len(news_list),
+            "topics": list(set(all_topics)),
+            "hot_topics": hot_topics,
+            "recent_headlines": headlines,
+            "recent_direction": llm_score,  # LLM 已综合判断，方向等同总分
+            "method": "llm",
+            "events": unique_events,
+            "event_discount": round(event_discount, 4),
+            "event_labels": [EVENT_LABELS.get(e["event_type"], e["event_type"]) for e in unique_events],
+        }
+
+    # ─── LLM 失败，fallback 到 FinBERT/关键词 ───
     scores = []
     all_topics = []
     headlines = []
+    all_events = []
     methods_used = set()
 
     for n in news_list:
@@ -374,11 +730,14 @@ def deep_sentiment(ticker, news_list):
         topics = result["topics"]
         methods_used.add(result.get("method", "keyword"))
 
+        events = detect_events(n["title"], n["summary"])
+        if events:
+            all_events.extend(events)
+
         scores.append(s)
         all_topics.extend(topics)
         headlines.append(n["title"])
 
-        # 时间衰减 — 最近新闻权重更高
         try:
             pub = datetime.strptime(n["date"][:25], "%a, %d %b %Y %H:%M:%S")
             hours_ago = (datetime.now() - pub).total_seconds() / 3600
@@ -387,27 +746,37 @@ def deep_sentiment(ticker, news_list):
         except Exception:
             pass
 
-    # 聚合情感
     avg_sentiment = np.clip(np.mean(scores), -1.0, 1.0)
 
-    # 情绪一致性 (0=分歧大, 1=完全一致)
     if len(scores) >= 2:
         consistency = 1.0 - np.std(scores)
     else:
         consistency = 0.5
 
-    # 最近方向（最新的2-3条）
     recent = scores[:3]
     recent_direction = np.mean(recent)
 
-    # 热门话题
     topic_counts = {}
     for t in all_topics:
         topic_counts[t] = topic_counts.get(t, 0) + 1
     hot_topics = sorted(topic_counts.items(), key=lambda x: -x[1])[:5]
 
-    # 新闻热度 (数量 + 时效性 = 紧迫度)
     urgency = min(len(news_list) / 10, 1.0) * (1.0 + abs(avg_sentiment))
+
+    event_counts = {}
+    for evt in all_events:
+        et = evt["event_type"]
+        if et not in event_counts:
+            event_counts[et] = {"count": 0, "min_severity": 1.0}
+        event_counts[et]["count"] += 1
+        event_counts[et]["min_severity"] = min(event_counts[et]["min_severity"], evt["severity"])
+
+    unique_events = [
+        {"event_type": et, "count": info["count"], "severity": info["min_severity"]}
+        for et, info in event_counts.items()
+    ]
+
+    event_discount = compute_event_discount(unique_events)
 
     method = "finbert" if "finbert" in methods_used else "keyword"
 
@@ -421,6 +790,9 @@ def deep_sentiment(ticker, news_list):
         "recent_headlines": headlines[:5],
         "recent_direction": round(recent_direction, 4),
         "method": method,
+        "events": unique_events,
+        "event_discount": round(event_discount, 4),
+        "event_labels": [EVENT_LABELS.get(e["event_type"], e["event_type"]) for e in unique_events],
     }
 
 
@@ -444,6 +816,9 @@ def build_sentiment_factors(tickers):
             "hot_topics": ",".join([f"{k}({v})" for k, v in sa["hot_topics"]]),
             "recent_direction": sa["recent_direction"],
             "method": sa["method"],
+            "events": sa["events"],
+            "event_discount": sa["event_discount"],
+            "event_labels": sa["event_labels"],
         }
     return factors
 
@@ -452,7 +827,7 @@ def build_sentiment_factors(tickers):
 # 5. 整合到 ML 评分
 # ═══════════════════════════════════════
 def sentiment_boost(ml_score_original, sentiment_factors, weight=0.15):
-    """将情绪因子融合进 ML 评分
+    """将情绪因子融合进 ML 评分（含异常事件折扣）
 
     Args:
         ml_score_original: ML 模型评分 (0~1)
@@ -462,6 +837,7 @@ def sentiment_boost(ml_score_original, sentiment_factors, weight=0.15):
     Returns:
         fused_score: 融合后评分 (0~1)
         adjustment: 调整幅度
+        event_adjustment: 事件折扣调整幅度
     """
     s = sentiment_factors
 
@@ -474,9 +850,9 @@ def sentiment_boost(ml_score_original, sentiment_factors, weight=0.15):
     if s.get("news_count", 0) == 0:
         sentiment_signal = 0
 
-    # FinBERT 方法有更高的置信度权重
-    if s.get("method") == "finbert" and s.get("news_count", 0) > 0:
-        sentiment_signal *= 1.2  # FinBERT 评分更可靠，放大信号
+    # LLM / FinBERT 方法有更高的置信度权重
+    if s.get("method") in ("llm", "finbert") and s.get("news_count", 0) > 0:
+        sentiment_signal *= 1.3 if s.get("method") == "llm" else 1.2
         sentiment_signal = np.clip(sentiment_signal, -1.0, 1.0)
 
     # 有重大负面话题则打折
@@ -495,7 +871,16 @@ def sentiment_boost(ml_score_original, sentiment_factors, weight=0.15):
     fused = ml_score_original * (1 - weight) + sentiment_norm * weight
     adjustment = fused - ml_score_original
 
-    return np.clip(fused, 0, 1), adjustment
+    # ─── 异常事件折扣 (额外惩罚, 不受weight控制) ───
+    event_discount = s.get("event_discount", 1.0)
+    events = s.get("events", [])
+    if events and event_discount < 1.0:
+        # 事件折扣: 直接乘以融合后评分
+        fused_with_event = fused * event_discount
+        event_adjustment = fused_with_event - fused
+        return np.clip(fused_with_event, 0, 1), adjustment, event_adjustment
+
+    return np.clip(fused, 0, 1), adjustment, 0.0
 
 
 # ═══════════════════════════════════════
@@ -564,11 +949,17 @@ if __name__ == "__main__":
         print(f"\n  批量获取 {len(US_WATCHLIST)} 只股票新闻情绪...")
         factors = build_sentiment_factors(US_WATCHLIST)
 
-        # ���印情绪排名
+        # 情绪评分排名
         ranked = sorted(factors.items(), key=lambda x: -x[1]["sentiment_score"])
+        # 确定方法标签
+        if any(f["method"] == "llm" for _, f in ranked):
+            method_label = "DeepSeek-V4-Flash"
+        elif any(f["method"] == "finbert" for _, f in ranked):
+            method_label = "FinBERT"
+        else:
+            method_label = "关键词"
         print(f"\n{'='*80}")
-        print(f"  情绪评分排名 (FinBERT)" if any(f["method"] == "finbert" for _, f in ranked)
-              else f"\n{'='*80}\n  情绪评分排名 (关键词)")
+        print(f"  情绪评分排名 ({method_label})")
         print(f"{'='*80}")
         print(f" {'#':>3} {'代码':>6} {'情绪分':>8} {'新闻数':>6} {'方向':>7} {'紧迫度':>8} {'方法':>8} {'热门话题'}")
         for i, (t, f) in enumerate(ranked[:15]):
@@ -609,12 +1000,14 @@ if __name__ == "__main__":
             sf = factors.get(t, {})
             if sf:
                 original = r["score"]
-                fused, adj = sentiment_boost(original, sf)
+                fused, adj, evt_adj = sentiment_boost(original, sf)
                 r["score"] = fused
                 r["sentiment_adj"] = adj
+                r["event_adj"] = evt_adj
                 r["sentiment_factors"] = sf
             else:
                 r["sentiment_adj"] = 0
+                r["event_adj"] = 0
                 r["sentiment_factors"] = {"sentiment_score": 0}
 
         # 重排序

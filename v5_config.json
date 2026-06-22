@@ -4,7 +4,7 @@
   "ml_scoring": {
     "top_n": 20,
     "min_trading_days": 200,
-    "test_splits": 2,
+    "test_splits": 4,
     "forecast_horizon_short": 21,
     "forecast_horizon_long": 21,
     "forecast_horizon_mom": 63,
@@ -15,10 +15,16 @@
       1008
     ],
     "cache_ttl_hours": 12,
-    "cache_refresh_hours": 4,
+    "cache_refresh_hours": 8,
     "score_formula": {
       "rank_weight": 0.85,
       "confidence_weight": 0.15
+    },
+    "sentiment": {
+      "weight": 0.15,
+      "event_discount_base": 0.85,
+      "event_min_keep": 0.10,
+      "event_direction_penalty": 0.3
     },
     "direction_thresholds": {
       "bullish": 0.15,

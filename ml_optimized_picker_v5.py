@@ -195,19 +195,21 @@ def _macro_cache_path():
     return os.path.join(CACHE_DIR, "macro_data.pkl")
 
 def get_cached_data(ticker, period="2y", force_refresh=False):
-    """带增量更新的缓存系统: 12h硬缓存, 但每4h尝试增量拉取最新行情补充"""
+    """带增量更新的缓存系统: 12h硬缓存, 但每8h尝试增量拉取最新行情补充"""
     path = _cache_path(ticker, period)
     if not force_refresh and os.path.exists(path):
         mtime = os.path.getmtime(path)
         age = time.time() - mtime
         if age < CACHE_TTL:
-            # 缓存仍在有效期内, 但如果超过4h且市场可能已变化, 增量补充
+            # 缓存仍在有效期内, 但如果超过增量刷新周期且市场可能已变化, 增量补充
             if age > CFG["cache_refresh_hours"] * 3600:
                 try:
                     import yfinance as yf
+                    import time as _ytime
                     df = pd.read_pickle(path)
                     # 只拉最近5个交易日的增量数据
                     last_date = df.index[-1]
+                    _ytime.sleep(0.3)  # 防限流: 调用前短暂等待
                     delta = yf.download(ticker, start=last_date - timedelta(3),
                                         auto_adjust=True, progress=False)
                     if not delta.empty:
@@ -233,15 +235,29 @@ def get_cached_data(ticker, period="2y", force_refresh=False):
                 except:
                     pass
 
-    import yfinance as yf
-    df = yf.download(ticker, period=period, auto_adjust=True, progress=False)
-    if not df.empty:
-        with open(path, "wb") as f:
-            pickle.dump(df, f)
-    return df
+    # 实时拉取 — 加间隔防限流
+    import time as _ytime
+    _ytime.sleep(0.3)  # 防限流: 每次全量下载前等待
+    try:
+        import yfinance as yf
+        df = yf.download(ticker, period=period, auto_adjust=True, progress=False)
+        if not df.empty:
+            with open(path, "wb") as f:
+                pickle.dump(df, f)
+            return df
+    except Exception:
+        pass
+    # 实时拉取失败 → 回退到过期缓存
+    if os.path.exists(path):
+        try:
+            with open(path, "rb") as f:
+                return pickle.load(f)
+        except Exception:
+            pass
+    return pd.DataFrame()
 
 def get_macro_data(force_refresh=False):
-    """获取宏观因子数据 (SPY, VIX, 板块ETF)"""
+    """获取宏观因子数据 (SPY, VIX, 板块ETF) — 批量下载优化"""
     path = _macro_cache_path()
     if not force_refresh and os.path.exists(path):
         mtime = os.path.getmtime(path)
@@ -267,21 +283,65 @@ def get_macro_data(force_refresh=False):
         "dxy": "DX-Y.NYB",  # 美元
         "hsi": "^HSI",  # 恒指
     }
+    
+    # 优化: 用一次批量下载替代12次单打, 减少限流风险
+    import time as _ytime
     result = {}
-    for name, t in macro_tickers.items():
+    ticker_symbols = list(macro_tickers.keys())
+    symbols_for_yf = list(macro_tickers.values())
+    
+    try:
+        batch = yf.download(symbols_for_yf, period="6mo", auto_adjust=True,
+                            progress=False, group_by="ticker")
+        if not batch.empty:
+            for name, sym in macro_tickers.items():
+                try:
+                    if isinstance(batch.columns, pd.MultiIndex) and batch.columns.nlevels > 1:
+                        # group_by="ticker" 模式: 列是 (ticker, field) 的多层索引
+                        close_series = batch.xs("Close", axis=1, level=1)[sym]
+                    else:
+                        # 单一ticker回退到单列
+                        d = yf.download(sym, period="6mo", auto_adjust=True, progress=False)
+                        if not d.empty:
+                            if isinstance(d.columns, pd.MultiIndex):
+                                d.columns = [c[0] for c in d.columns]
+                            close_series = d["Close"]
+                        else:
+                            continue
+                    if close_series is not None and not close_series.empty:
+                        result[name] = close_series
+                except Exception:
+                    pass
+            _ytime.sleep(0.5)  # 批量后短暂休息
+    except Exception:
+        pass
+    
+    # 批量失败回退: 逐个下载 (加间隔控制频率)
+    if not result:
+        for name, t in macro_tickers.items():
+            try:
+                d = yf.download(t, period="6mo", auto_adjust=True, progress=False)
+                if not d.empty:
+                    if isinstance(d.columns, pd.MultiIndex):
+                        d.columns = [c[0] for c in d.columns]
+                    result[name] = d["Close"]
+                _ytime.sleep(0.3)  # 逐个下载间隔, 防限流
+            except:
+                pass
+    
+    if result:
+        # 至少成功拉取了一些数据才缓存
+        with open(path, "wb") as f:
+            pickle.dump(result, f)
+        return result
+    # 实时拉取全部失败 → 回退过期缓存
+    if os.path.exists(path):
         try:
-            d = yf.download(t, period="6mo", auto_adjust=True, progress=False)
-            if not d.empty:
-                if isinstance(d.columns, pd.MultiIndex):
-                    d.columns = [c[0] for c in d.columns]
-                result[name] = d["Close"]
+            with open(path, "rb") as f:
+                return pickle.load(f)
         except:
             pass
-    
-    with open(path, "wb") as f:
-        pickle.dump(result, f)
-    return result
-
+    return {}
 
 def get_ticker_sector(ticker):
     for sector, stocks in SECTOR_MAP.items():
@@ -772,14 +832,25 @@ def score_stock_v5(ticker, macro_data=None, period="2y", force_refresh=False):
     # 最新预测收益
     latest_pred_reg = float(rank_df.iloc[-1].mean())  # 用排名百分位表示
     # 实际最新5日收益(用于对比)
-    closes = df_used["Close"].values.astype(float)
-    actual_5d = (closes[-1] / closes[-min(6, len(closes))] - 1) * 100 if len(closes) >= 2 else 0
-    mom_1m = (closes[-1] / closes[-21] - 1) * 100 if len(closes) >= 21 else 0
-    mom_3m = (closes[-1] / closes[-63] - 1) * 100 if len(closes) >= 63 else 0
+    # ─── P2c: 防NaN兜底——yfinance偶发最后一天Close=NaN（未结算）───
+    closes_raw = df_used["Close"].values.astype(float)
+    # 找最后一个有效收盘价
+    valid_mask = ~np.isnan(closes_raw) & (closes_raw > 0)
+    if valid_mask.any():
+        last_valid_idx = np.where(valid_mask)[0][-1]
+        last_close = closes_raw[last_valid_idx]
+        closes = closes_raw[:last_valid_idx + 1]  # 截断到有效位置
+    else:
+        last_close = 0.0
+        closes = closes_raw
+
+    actual_5d = (last_close / closes[-min(6, len(closes))] - 1) * 100 if len(closes) >= 2 else 0
+    mom_1m = (last_close / closes[-21] - 1) * 100 if len(closes) >= 21 else 0
+    mom_3m = (last_close / closes[-63] - 1) * 100 if len(closes) >= 63 else 0
 
     return {
         "ticker": ticker,
-        "price": round(float(closes[-1]), 2),
+        "price": round(float(last_close), 2) if last_close > 0 else 0.0,
         "score": round(final_score, 4),          # v5: 新评分(0~1)
         "rank_pctl": round(latest_rank, 4),       # 排名百分位
         "confidence": round(confidence, 4),       # 模型一致性
@@ -844,6 +915,9 @@ def run_ml_picking_v5(tickers=None, market="US", macro_data=None,
             errors.append(t)
             if verbose:
                 print(f"  失败: {e}")
+        # 防限流: 每只股票之间短暂间隔, 给YF缓存喘息时间
+        if i < total - 1:
+            time.sleep(0.15)
 
     results.sort(key=lambda x: x["score"], reverse=True)
     return results, errors
@@ -886,6 +960,23 @@ def print_report_v5(all_results, title="ML v5 选股报告"):
     bearish = [s for s in all_results if s["direction"] == "看跌"]
     print(f"  看涨方向: {len(bullish)} 只 | 看跌方向: {len(bearish)} 只")
 
+    # ─── 数据质量报告 ───
+    r2s = [s["walk_forward_r2"] for s in all_results]
+    avg_r2 = np.mean(r2s)
+    neg_r2_ratio = sum(1 for r in r2s if r < 0) / len(r2s) * 100
+    # mom指标可用性
+    mom1m_ok = sum(1 for s in all_results if not np.isnan(s.get("mom_1m", np.nan)))
+    mom3m_ok = sum(1 for s in all_results if not np.isnan(s.get("mom_3m", np.nan)))
+    price_ok = sum(1 for s in all_results if s.get("price", 0) > 0)
+    print(f"\n  📊 数据质量:")
+    print(f"     平均 R²: {avg_r2:.3f} | 负R²比例: {neg_r2_ratio:.0f}%")
+    print(f"     有价格: {price_ok}/{len(all_results)} | mom_1m有效: {mom1m_ok}/{len(all_results)} | mom_3m有效: {mom3m_ok}/{len(all_results)}")
+    if avg_r2 < -0.1:
+        print(f"     ⚠️  R²均值 {avg_r2:.2f}（模型预测力偏弱），评分已启用动量兜底")
+    if mom1m_ok < len(all_results) * 0.8:
+        missing_price = [s["ticker"] for s in all_results if s.get("price", 0) <= 0]
+        print(f"     ⚠️  部分股票最新收盘价异常（可能当日未结算），已回退到上一个交易日数据 → {', '.join(missing_price[:5])}")
+
     # 推荐详情
     print(f"\n{'='*95}")
     print(f"  推荐详情 Top 8")
@@ -899,14 +990,21 @@ def print_report_v5(all_results, title="ML v5 选股报告"):
         print(f"     板块: {s['sector']} | 方向: {s['direction']} | 共识度: {s['confidence']:.2f}")
         print(f"     排名百分位: {s['rank_pctl']:.1%} | R²: {s['walk_forward_r2']:.3f}")
         print(f"     现价: ${s['price']:.2f} | 1月: {s['mom_1m']:+.1f}% | 3月: {s['mom_3m']:+.1f}%")
+        # 异常事件预警（如果有）
+        sf = s.get("sentiment_factors", {})
+        if sf.get("events"):
+            evt_str = " + ".join(sf.get("event_labels", []))
+            discount = sf.get("event_discount", 1.0)
+            print(f"     ⚠️  异常事件: {evt_str} (折扣 {discount:.3f})")
 
     return all_results[:8]
 
 
 def save_results_v5(results, filename="ml_v5_picks"):
-    """保存结果"""
+    """保存结果（含情绪因子列，如有）"""
     rows = []
     for s in results:
+        sf = s.get("sentiment_factors", {})
         rows.append({
             "ticker": s["ticker"],
             "score": s["score"],
@@ -920,6 +1018,10 @@ def save_results_v5(results, filename="ml_v5_picks"):
             "mom_3m": s["mom_3m"],
             "sector": s["sector"],
             "models_used": "+".join(s["models_used"]),
+            "sentiment_score": sf.get("sentiment_score", ""),
+            "news_count": sf.get("news_count", ""),
+            "events": "+".join(sf.get("event_labels", [])),
+            "event_discount": sf.get("event_discount", ""),
         })
     df = pd.DataFrame(rows)
     now = datetime.now().strftime("%Y%m%d_%H%M")
@@ -939,6 +1041,7 @@ if __name__ == "__main__":
     parser.add_argument("--hk-only", action="store_true", help="只跑港股")
     parser.add_argument("--refresh", action="store_true", help="强制刷新缓存")
     parser.add_argument("--top", type=int, default=TOP_N, help="输出前N只")
+    parser.add_argument("--sentiment", action="store_true", help="融合新闻情绪因子和异常事件检测")
     args = parser.parse_args()
 
     print("=" * 80)
@@ -974,7 +1077,7 @@ if __name__ == "__main__":
 
     if all_results:
         all_results.sort(key=lambda x: x["score"], reverse=True)
-        
+
         report_title = "ML v5 选股报告"
         if args.us_only:
             report_title += " (仅美股)"
@@ -982,7 +1085,74 @@ if __name__ == "__main__":
             report_title += " (仅港股)"
         else:
             report_title += " (美股+港股)"
-        
+
+        # ─── 融合新闻情绪因子 + 异常事件检测 (在打印报告之前) ───
+        if args.sentiment:
+            print(f"\n{'='*50}")
+            print(f"  📰 加载新闻情绪 + 异常事件检测...")
+            print(f"{'='*50}")
+            try:
+                from finbert_sentiment import build_sentiment_factors, sentiment_boost
+
+                # 收集所有 ticker
+                all_tickers = list(set(r["ticker"] for r in all_results))
+                sentiment_factors = build_sentiment_factors(all_tickers)
+
+                llm_count = sum(1 for f in sentiment_factors.values() if f.get("method") == "llm")
+                finbert_count = sum(1 for f in sentiment_factors.values() if f.get("method") == "finbert")
+                keyword_count = len(all_tickers) - llm_count - finbert_count
+                print(f"  DeepSeek-V4-Flash: {llm_count} 只 | 关键词: {keyword_count} 只")
+
+                event_stocks = []
+                for r in all_results:
+                    t = r["ticker"]
+                    sf = sentiment_factors.get(t, {})
+                    if sf and sf.get("news_count", 0) > 0:
+                        original = r["score"]
+                        fused, adj, evt_adj = sentiment_boost(original, sf)
+                        r["score"] = fused
+                        r["ml_score_raw"] = original
+                        r["sentiment_adj"] = adj
+                        r["event_adj"] = evt_adj
+                        r["sentiment_factors"] = sf
+                        if sf.get("events"):
+                            event_stocks.append((t, sf["event_labels"], sf.get("event_discount", 1.0)))
+                    else:
+                        r["sentiment_adj"] = 0
+                        r["event_adj"] = 0
+                        r["ml_score_raw"] = r["score"]
+                        r["sentiment_factors"] = {"sentiment_score": 0, "events": []}
+
+                # 重排序
+                all_results.sort(key=lambda x: x["score"], reverse=True)
+
+                # 异常事件预警
+                if event_stocks:
+                    print(f"\n  ⚠️  异常事件预警 ({len(event_stocks)} 只):")
+                    for t, labels, discount in event_stocks:
+                        label_str = " + ".join(labels)
+                        print(f"    🔴 {t}: {label_str} (折扣系数 {discount:.3f})")
+
+                # 打印融合详情 Top
+                print(f"\n  {'='*100}")
+                print(f"  情绪因子 + 异常事件 调整详情 (Top 10)")
+                print(f"  {'='*100}")
+                print(f"  {'代码':>6} {'ML原始':>8} {'情绪调':>8} {'事件调':>8} {'最终分':>8} {'新闻':>5} {'事件'}")
+                for r in all_results[:10]:
+                    sf = r.get("sentiment_factors", {})
+                    adj = r.get("sentiment_adj", 0)
+                    evt_adj = r.get("event_adj", 0)
+                    orig = r.get("ml_score_raw", r["score"] - adj - evt_adj)
+                    events_str = " + ".join(sf.get("event_labels", [])) or "—"
+                    print(f"  {r['ticker']:>6} {orig:>8.4f} {adj:>+8.4f} {evt_adj:>+8.4f} {r['score']:>8.4f} {sf.get('news_count',0):>5} {events_str}")
+
+                print(f"\n  ✅ 情绪融合完成! ({len(all_tickers)} 只)")
+            except ImportError as e:
+                print(f"  ❌ 情绪模块加载失败: {e}")
+                print(f"     请确保 finbert_sentiment.py 与当前脚本在同一目录")
+            except Exception as e:
+                print(f"  ❌ 情绪融合失败: {e}")
+
         top = print_report_v5(all_results, title=report_title)
         save_results_v5(all_results)
 
