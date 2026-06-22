@@ -274,7 +274,7 @@ def run_pre_market(market, sentiment=False):
 # ═══════════════════════════════════════
 # Post-Market: 收市后复盘对比
 # ═══════════════════════════════════════
-def run_post_market(market):
+def run_post_market(market, sentiment=False):
     """收市后复盘：对比预测 vs 实际，分析差异，自动优化"""
     import pandas as pd
     from scipy.stats import spearmanr
@@ -429,11 +429,19 @@ def run_post_market(market):
     high_conf_wrong = [c for c in compare if c["score"] > 0.5 and not c["correct"]]
     if high_conf_wrong:
         tickers_str = ", ".join(f"{c['ticker']}({c['name']})" for c in high_conf_wrong[:5])
-        suggestions.append({
-            "type": "high_conf_failures",
-            "severity": "high",
-            "detail": f"以下高共识度股票预测错误: {tickers_str}。建议：检查这些股票是否有异常事件驱动(财报/并购/监管)",
-        })
+        if sentiment:
+            # --sentiment 已启用，情绪+事件检测会在后面做，这里只提示
+            suggestions.append({
+                "type": "high_conf_failures",
+                "severity": "high",
+                "detail": f"以下高共识度股票预测错误: {tickers_str}（情绪+事件检测结果见下方）",
+            })
+        else:
+            suggestions.append({
+                "type": "high_conf_failures",
+                "severity": "high",
+                "detail": f"以下高共识度股票预测错误: {tickers_str}。建议：启用 --sentiment 运行新闻情绪+异常事件检测",
+            })
 
     # ─── 5. 方向信号来源分析 ───
     dir_sources = {}
@@ -546,6 +554,46 @@ def run_post_market(market):
             change["action"] = "applied"
 
     # 保存优化记录 (更新后保存)
+
+    # ─── 异常事件检测 (--sentiment) ───
+    if sentiment and predictions:
+        print(f"\n  📰 复盘情绪 + 异常事件检测...")
+        try:
+            from finbert_sentiment import build_sentiment_factors, sentiment_boost
+
+            all_tickers = [p["ticker"] for p in predictions]
+            sentiment_factors = build_sentiment_factors(all_tickers)
+
+            for p in predictions:
+                t = p["ticker"]
+                sf = sentiment_factors.get(t, {})
+                if sf and sf.get("news_count", 0) > 0:
+                    original = p["score"]
+                    fused, adj, evt_adj = sentiment_boost(original, sf)
+                    p["score"] = fused
+                    p["sentiment_adj"] = adj
+                    p["event_adj"] = evt_adj
+                    if adj or evt_adj:
+                        print(f"      {t}: {original:.3f} → {fused:.3f}"
+                              f"{f' (情绪{adj:+.3f})' if abs(adj) > 0.01 else ''}"
+                              f"{f' (事件{evt_adj:+.3f})' if abs(evt_adj) > 0.01 else ''}")
+
+            # 输出事件检测摘要
+            all_events = [(t, sf) for t, sf in sentiment_factors.items()
+                          if sf and sf.get("event_signals")]
+            if all_events:
+                print(f"\n  ⚡ 异常事件检测:")
+                for t, sf in sorted(all_events, key=lambda x: -abs(x[1].get("event_signals", {}).get("event_magnitude", 0)))[:5]:
+                    sig = sf.get("event_signals", {})
+                    mag = sig.get("event_magnitude", 0)
+                    desc = sig.get("event_description", "未知事件")
+                    print(f"      {t}: {desc} (强度{mag:.2f})")
+            else:
+                print(f"  ✓ 未检测到异常事件")
+        except ImportError:
+            print(f"  ⚠️  finbert_sentiment.py 未找到，跳过情绪融合")
+        except Exception as e:
+            print(f"  ⚠️  情绪融合异常: {e}")
 
     # 输出最终摘要
     print(f"\n  {'='*60}")
@@ -676,7 +724,7 @@ if __name__ == "__main__":
     if args.mode == "pre":
         run_pre_market(args.market, sentiment=args.sentiment)
     else:
-        result = run_post_market(args.market)
+        result = run_post_market(args.market, sentiment=args.sentiment)
         if result:
             # no_agent模式: 输出JSON到stdout用于cron通知
             summary = {
