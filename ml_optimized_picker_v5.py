@@ -50,6 +50,97 @@ CACHE_DIR = os.path.expanduser("~/.cache/hermes-quant")
 os.makedirs(CACHE_DIR, exist_ok=True)
 CACHE_TTL = CFG["cache_ttl_hours"] * 3600  # 从配置读取
 
+# ──── 全局限流控制 ────
+# 一旦 YF 返回 rate-limit 错误，本运行周期内跳过所有后续下载，直接回退缓存
+_YF_GLOBAL_RATELIMITED = [False]  # 用 list 包装使可被函数内修改
+_YF_SHARED_SESSION = None
+
+def _get_yf_session():
+    """获取/创建共享 requests.Session，带重试策略"""
+    global _YF_SHARED_SESSION
+    if _YF_SHARED_SESSION is None:
+        import requests
+        from requests.adapters import HTTPAdapter
+        from urllib3.util.retry import Retry
+        _YF_SHARED_SESSION = requests.Session()
+        retry_strategy = Retry(
+            total=2, backoff_factor=0.5,
+            status_forcelist=[429, 500, 502, 503, 504]
+        )
+        adapter = HTTPAdapter(max_retries=retry_strategy)
+        _YF_SHARED_SESSION.mount('https://', adapter)
+        _YF_SHARED_SESSION.mount('http://', adapter)
+    return _YF_SHARED_SESSION
+
+def _is_yf_ratelimited():
+    return _YF_GLOBAL_RATELIMITED[0]
+
+def _set_yf_ratelimited():
+    _YF_GLOBAL_RATELIMITED[0] = True
+
+def _yf_quick_probe():
+    """快速探测 YF 是否可用 — 用轻量 HTTP 请求检查, 不 yf.download
+    已标记限流则跳过探测"""
+    if _is_yf_ratelimited():
+        return False
+    try:
+        import requests
+        r = requests.get(
+            "https://query1.finance.yahoo.com/v8/finance/chart/SPY?interval=1d&range=1d",
+            timeout=3,
+            headers={"User-Agent": "Mozilla/5.0"}
+        )
+        ok = r.status_code == 200
+        if not ok:
+            _set_yf_ratelimited()
+        return ok
+    except Exception:
+        _set_yf_ratelimited()
+        return False
+
+def _download_yf(tickers, **kwargs):
+    """带 session 复用和全局限流检测的 yf.download 封装
+    单只股票用 Ticker.history() 避免 yf.download() 的 curl_cffi 兼容问题
+    批量下载请呼叫我时带上 _batch=True """
+    if _is_yf_ratelimited():
+        return pd.DataFrame()
+    kwargs.pop('session', None)  # 不传 session，yfinance 1.4.1 用 curl_cffi 而非 requests
+    kwargs.setdefault('timeout', 10)
+    try:
+        import yfinance as yf
+        import time as _ytime
+        _ytime.sleep(0.3)
+
+        if kwargs.pop('_batch', False) or isinstance(tickers, list):
+            # 批量多只 → 用 yf.download（不带自定义 session）
+            df = yf.download(tickers, **kwargs)
+        else:
+            # 单只 → 用 Ticker.history（100% 兼容港股长周期）
+            tk = yf.Ticker(tickers)
+            # 提取兼容参数
+            hist_kw = {}
+            for k in ('period', 'start', 'end', 'interval', 'auto_adjust',
+                       'back_adjust', 'round', 'actions'):
+                if k in kwargs:
+                    hist_kw[k] = kwargs[k]
+            df = tk.history(**hist_kw)
+            # 统一列名（Ticker.history 返回小写列名, 但代码用大写 "Close"）
+            if df is not None and not df.empty and hasattr(df, 'columns'):
+                if df.columns[0].islower():
+                    cap_map = {c: c.title() for c in df.columns}
+                    df = df.rename(columns=cap_map)
+        # 统一时区: yf.download / Ticker.history 都可能返回带时区的时间戳
+        if df is not None and not df.empty and hasattr(df, 'index'):
+            if hasattr(df.index, 'tz') and df.index.tz is not None:
+                df.index = df.index.tz_localize(None)
+        return df
+    except Exception as e:
+        err_str = str(e)
+        if any(kw in err_str for kw in ['Rate', '429', 'limit',
+                                         'Connection', 'Timeout', 'Remote']):
+            _set_yf_ratelimited()
+        return pd.DataFrame()
+
 # ──── ML 模型 ────
 from sklearn.ensemble import RandomForestRegressor, RandomForestClassifier
 from sklearn.preprocessing import StandardScaler
@@ -125,6 +216,11 @@ FORECAST_HORIZON_MOM = CFG["forecast_horizon_mom"]
 WARMUP = CFG["warmup"]
 
 ADAPTIVE_WINDOWS = CFG["adaptive_windows"]
+# 新增配置
+MARKET_REGIME_CFG = CFG.get("market_regime", {})
+STOCK_PENALTY_CFG = CFG.get("stock_penalty", {})
+SCORE_SPREAD_CFG = CFG.get("score_spread", {})
+SENTIMENT_V2_CFG = CFG.get("sentiment_v2", {})
 
 # v5: 移除ETF, 补全股票池
 SECTOR_MAP = {
@@ -145,10 +241,14 @@ SECTOR_MAP = {
 
 MODELS_REGRESSION = {
     "rf": "rf",
+    "xgb": "xgb",
+    "lgb": "lgb",
 }
 
 MODELS_CLASSIFICATION = {
     "rf": "rf",
+    "xgb": "xgb",
+    "lgb": "lgb",
 }
 
 # 美股 + 港股 (移除ETF)
@@ -195,63 +295,98 @@ def _macro_cache_path():
     return os.path.join(CACHE_DIR, "macro_data.pkl")
 
 def get_cached_data(ticker, period="2y", force_refresh=False):
-    """带增量更新的缓存系统: 12h硬缓存, 但每8h尝试增量拉取最新行情补充"""
+    """带增量更新的缓存系统: 12h硬缓存, 但每8h尝试增量拉取最新行情补充
+    港股走腾讯财经, 美股走 YF/YF限流回退缓存"""
     path = _cache_path(ticker, period)
-    if not force_refresh and os.path.exists(path):
-        mtime = os.path.getmtime(path)
-        age = time.time() - mtime
-        if age < CACHE_TTL:
-            # 缓存仍在有效期内, 但如果超过增量刷新周期且市场可能已变化, 增量补充
-            if age > CFG["cache_refresh_hours"] * 3600:
+    
+    # ─── 港股 → 走腾讯财经 ───
+    if ticker.endswith(".HK"):
+        from tencent_data import get_hk_kline_data
+        return get_hk_kline_data(ticker, force_refresh=force_refresh, cache_ttl_hours=CFG["cache_ttl_hours"])
+    
+    # ─── 美股 → 走 YF，但有缓存优先逻辑 ───
+    # 先检查缓存
+    if os.path.exists(path) and not force_refresh:
+        try:
+            with open(path, "rb") as f:
+                cached = pickle.load(f)
+            mtime = os.path.getmtime(path)
+            age = time.time() - mtime
+            
+            # 缓存12小时内 → 直接返回
+            if age < CACHE_TTL:
+                return cached
+            
+            # 缓存超过12小时但不超过5天 → 尝试快速增量
+            if age < 5 * 24 * 3600:
+                # 先做快速探测，探测快速失败就回退缓存
+                if not _yf_quick_probe():
+                    return cached  # YF不可用，直接回退
+                # YF可用 → 尝试增量刷新
                 try:
-                    import yfinance as yf
-                    import time as _ytime
-                    df = pd.read_pickle(path)
-                    # 只拉最近5个交易日的增量数据
-                    last_date = df.index[-1]
-                    _ytime.sleep(0.3)  # 防限流: 调用前短暂等待
-                    delta = yf.download(ticker, start=last_date - timedelta(3),
-                                        auto_adjust=True, progress=False)
+                    last_date = cached.index[-1]
+                    delta = _download_yf(ticker, start=last_date - timedelta(3),
+                                         auto_adjust=True, progress=False)
                     if not delta.empty:
                         if isinstance(delta.columns, pd.MultiIndex):
                             delta.columns = [c[0] for c in delta.columns]
-                        new_rows = delta.index.difference(df.index)
+                        new_rows = delta.index.difference(cached.index)
                         if len(new_rows) > 0:
-                            df = pd.concat([df, delta.loc[new_rows]])
-                            df.to_pickle(path)
+                            df = pd.concat([cached, delta.loc[new_rows]])
+                            with open(path, "wb") as f:
+                                pickle.dump(df, f)
                             return df
-                    return df
+                    return cached
                 except:
-                    # 增量失败, 返回缓存
-                    try:
-                        with open(path, "rb") as f:
-                            return pickle.load(f)
-                    except:
-                        pass
-            else:
-                try:
-                    with open(path, "rb") as f:
-                        return pickle.load(f)
-                except:
-                    pass
-
-    # 实时拉取 — 加间隔防限流
-    import time as _ytime
-    _ytime.sleep(0.3)  # 防限流: 每次全量下载前等待
-    try:
-        import yfinance as yf
-        df = yf.download(ticker, period=period, auto_adjust=True, progress=False)
-        if not df.empty:
-            with open(path, "wb") as f:
-                pickle.dump(df, f)
-            return df
-    except Exception:
-        pass
+                    return cached  # 增量失败，还是返回缓存
+            
+            # 缓存超过5天 → 尝试实时拉取，失败才回退
+            pass  # 继续下面的实时拉取逻辑
+        except Exception:
+            pass
+    
+    # 实时拉取 — 先快速探测
+    if not _yf_quick_probe():
+        # YF不可用 → 尝试akShare备用
+        try:
+            import akshare as ak
+            from datetime import datetime
+            df_ak = ak.stock_us_daily(symbol=ticker, adjust='')
+            if not df_ak.empty and len(df_ak) > 10:
+                # 转换列名: date→Date, open→Open 等
+                cols_map = {'date': 'Date', 'open': 'Open', 'high': 'High', 'low': 'Low', 'close': 'Close', 'volume': 'Volume'}
+                df_ak = df_ak.rename(columns=cols_map)
+                df_ak['Date'] = pd.to_datetime(df_ak['Date'])
+                df_ak = df_ak.set_index('Date').sort_index()
+                # 只保留2年数据
+                cutoff = pd.Timestamp.now() - pd.Timedelta(days=730)
+                df_ak = df_ak[df_ak.index >= cutoff]
+                if not df_ak.empty:
+                    with open(path, "wb") as f:
+                        pickle.dump(df_ak, f)
+                    return df_ak
+        except Exception:
+            pass
+        
+        # 有缓存就回退
+        if os.path.exists(path):
+            try:
+                with open(path, "rb") as f:
+                    return pickle.load(f)
+            except:
+                pass
+        return pd.DataFrame()
+    
+    df = _download_yf(ticker, period=period, auto_adjust=True, progress=False)
+    if not df.empty:
+        with open(path, "wb") as f:
+            pickle.dump(df, f)
+        return df
+    
     # 实时拉取失败 → 回退到过期缓存
     if os.path.exists(path):
         try:
-            with open(path, "rb") as f:
-                return pickle.load(f)
+            return pickle.load(open(path, "rb"))
         except Exception:
             pass
     return pd.DataFrame()
@@ -264,81 +399,198 @@ def get_macro_data(force_refresh=False):
         if time.time() - mtime < CACHE_TTL:
             try:
                 with open(path, "rb") as f:
-                    return pickle.load(f)
+                    result = pickle.load(f)
+                # 统一时区: 确保所有宏观因子Series是tz-naive
+                for k in result:
+                    if hasattr(result[k], 'index') and hasattr(result[k].index, 'tz') and result[k].index.tz is not None:
+                        result[k].index = result[k].index.tz_localize(None)
+                return result
             except:
                 pass
     
-    import yfinance as yf
     macro_tickers = {
         "spy": "SPY",
         "vix": "^VIX",
         "xlk": "XLK",  # 科技
-        "xlf": "XLF",  # 金融
-        "xle": "XLE",  # 能源
         "xlv": "XLV",  # 医疗
         "xli": "XLI",  # 工业
         "xlp": "XLP",  # 消费必需
         "xly": "XLY",  # 消费可选
         "iwm": "IWM",  # 小盘
         "dxy": "DX-Y.NYB",  # 美元
-        "hsi": "^HSI",  # 恒指
+        "hsi": "^HSI",  # 恒指（走腾讯财经）
     }
     
-    # 优化: 用一次批量下载替代12次单打, 减少限流风险
-    import time as _ytime
     result = {}
-    ticker_symbols = list(macro_tickers.keys())
     symbols_for_yf = list(macro_tickers.values())
     
-    try:
-        batch = yf.download(symbols_for_yf, period="6mo", auto_adjust=True,
-                            progress=False, group_by="ticker")
-        if not batch.empty:
-            for name, sym in macro_tickers.items():
-                try:
-                    if isinstance(batch.columns, pd.MultiIndex) and batch.columns.nlevels > 1:
-                        # group_by="ticker" 模式: 列是 (ticker, field) 的多层索引
-                        close_series = batch.xs("Close", axis=1, level=1)[sym]
-                    else:
-                        # 单一ticker回退到单列
-                        d = yf.download(sym, period="6mo", auto_adjust=True, progress=False)
-                        if not d.empty:
-                            if isinstance(d.columns, pd.MultiIndex):
-                                d.columns = [c[0] for c in d.columns]
-                            close_series = d["Close"]
-                        else:
-                            continue
-                    if close_series is not None and not close_series.empty:
-                        result[name] = close_series
-                except Exception:
-                    pass
-            _ytime.sleep(0.5)  # 批量后短暂休息
-    except Exception:
-        pass
-    
-    # 批量失败回退: 逐个下载 (加间隔控制频率)
-    if not result:
-        for name, t in macro_tickers.items():
+    # 快速探测: 先试一次是否全局限流, 避免12个ticker逐个超时
+    if not _yf_quick_probe() and _is_yf_ratelimited():
+        print(f"  ⚠️  YF 不可用，快速回退到过期缓存")
+        # 至少尝试从腾讯财经获取HSI
+        hsi = None
+        try:
+            from tencent_data import fetch_hsi_kline
+            hsi_series = fetch_hsi_kline(500)
+            if not hsi_series.empty:
+                print(f"  📡 已从腾讯财经获取HSI替代 ({len(hsi_series)}行)")
+                hsi = hsi_series
+        except:
+            pass
+        
+        if os.path.exists(path):
             try:
-                d = yf.download(t, period="6mo", auto_adjust=True, progress=False)
-                if not d.empty:
-                    if isinstance(d.columns, pd.MultiIndex):
-                        d.columns = [c[0] for c in d.columns]
-                    result[name] = d["Close"]
-                _ytime.sleep(0.3)  # 逐个下载间隔, 防限流
+                cached = pickle.load(open(path, "rb"))
+                # 统一时区
+                for k in cached:
+                    if hasattr(cached[k], 'index') and hasattr(cached[k].index, 'tz') and cached[k].index.tz is not None:
+                        cached[k].index = cached[k].index.tz_localize(None)
+                # 回退前的NaN清洗: ffill避免尾行NaN传播
+                for k in list(cached.keys()):
+                    s = cached[k]
+                    if s.notna().sum() < 5:
+                        del cached[k]
+                    else:
+                        cached[k] = s.ffill()
+                # 如果腾讯HSI可用，替换或补充缓存中的HSI
+                try:
+                    from tencent_data import fetch_hsi_kline
+                    if not hsi.empty:
+                        cached['hsi'] = hsi['Close']
+                        print(f"  ✅ HSI已刷新 ({len(hsi)}行)")
+                        with open(path, "wb") as f:
+                            pickle.dump(cached, f)
+                except:
+                    pass
+                # 同时尝试akShare刷新SPY/XLK等ETF宏观因子
+                try:
+                    import akshare as ak
+                    refreshed = 0
+                    for name, sym in macro_tickers.items():
+                        if name in ('hsi', 'vix', 'dxy') or name in cached:
+                            continue
+                        try:
+                            df = ak.stock_us_daily(symbol=sym, adjust='')
+                            if not df.empty:
+                                s = df.set_index('date')['close']
+                                s.index = pd.to_datetime(s.index)
+                                s = s.sort_index()
+                                if hasattr(s.index, 'tz') and s.index.tz is not None:
+                                    s.index = s.index.tz_localize(None)
+                                cached[name] = s
+                                refreshed += 1
+                        except:
+                            pass
+                    if refreshed > 0:
+                        print(f"  ✅ akShare刷新{refreshed}个ETF因子")
+                        with open(path, "wb") as f:
+                            pickle.dump(cached, f)
+                except:
+                    pass
+                return cached
             except:
+                pass
+        # 无缓存但有腾讯HSI
+        try:
+            if not hsi.empty:
+                result = {'hsi': hsi['Close']}
+                with open(path, "wb") as f:
+                    pickle.dump(result, f)
+                print(f"  ✅ 纯腾讯HSI因子 ({len(hsi)}行)")
+                return result
+        except:
+            pass
+        return {}
+    
+    # 批量下载 — 使用共享 session
+    batch = _download_yf(symbols_for_yf, period="6mo", auto_adjust=True,
+                         progress=False, group_by="ticker", _batch=True)
+    if not batch.empty:
+        for name, sym in macro_tickers.items():
+            try:
+                if isinstance(batch.columns, pd.MultiIndex) and batch.columns.nlevels > 1:
+                    close_series = batch.xs("Close", axis=1, level=1)[sym]
+                else:
+                    continue
+                if close_series is not None and not close_series.empty:
+                    result[name] = close_series
+            except Exception:
                 pass
     
     if result:
-        # 至少成功拉取了一些数据才缓存
+        # 统一时区: 确保所有宏观因子Series是tz-naive
+        for k in result:
+            if hasattr(result[k], 'index') and hasattr(result[k].index, 'tz') and result[k].index.tz is not None:
+                result[k].index = result[k].index.tz_localize(None)
+        # 清洗NaN: YF在非交易日返回NaN, ffill确保尾行有效
+        # 如果整个series全NaN(如已退市ETF), 丢弃
+        for k in list(result.keys()):
+            s = result[k]
+            if s.notna().sum() < 5:
+                del result[k]
+                print(f"  ⚠️ 丢弃 {k}: 有效数据不足5行")
+            else:
+                result[k] = s.ffill()
         with open(path, "wb") as f:
             pickle.dump(result, f)
         return result
-    # 实时拉取全部失败 → 回退过期缓存
+    
+    # 批量下载失败 → 尝试akShare备用
+    if not _is_yf_ratelimited():
+        # YF不是限流引起的失败，可能只是批量下载超时，尝试akShare
+        pass
+    try:
+        import akshare as ak
+        print(f"  📡 尝试akShare备用获取宏观因子...")
+        ak_ok = 0
+        for name, sym in macro_tickers.items():
+            if name in result:
+                continue
+            if sym.startswith("^"):
+                continue  # VIX/恒指不走akShare
+            if sym == "DX-Y.NYB":
+                continue  # DXY不走akShare
+            try:
+                df = ak.stock_us_daily(symbol=sym, adjust='')
+                if not df.empty:
+                    close_series = df.set_index('date')['close']
+                    close_series.index = pd.to_datetime(close_series.index)
+                    close_series = close_series.sort_index()
+                    if hasattr(close_series.index, 'tz') and close_series.index.tz is not None:
+                        close_series.index = close_series.index.tz_localize(None)
+                    result[name] = close_series
+                    ak_ok += 1
+            except:
+                pass
+        
+        if result:
+            print(f"  ✅ akShare备用获取 {ak_ok}/{len(macro_tickers)} 个因子")
+            for k in result:
+                if hasattr(result[k], 'index') and hasattr(result[k].index, 'tz') and result[k].index.tz is not None:
+                    result[k].index = result[k].index.tz_localize(None)
+            with open(path, "wb") as f:
+                pickle.dump(result, f)
+            return result
+    except:
+        pass
+    
+    # 实时拉取完全失败 → 立即回退过期缓存，不再逐个重试
     if os.path.exists(path):
         try:
-            with open(path, "rb") as f:
-                return pickle.load(f)
+            cached = pickle.load(open(path, "rb"))
+            # 统一时区: 确保所有宏观因子Series是tz-naive
+            for k in cached:
+                if hasattr(cached[k], 'index') and hasattr(cached[k].index, 'tz') and cached[k].index.tz is not None:
+                    cached[k].index = cached[k].index.tz_localize(None)
+            # 过期缓存也需要NaN清洗
+            for k in list(cached.keys()):
+                s = cached[k]
+                if s.notna().sum() < 5:
+                    del cached[k]
+                else:
+                    cached[k] = s.ffill()
+            print(f"  ⚠️  YF 实时拉取失败，回退到过期缓存 ({len(cached)}个因子)")
+            return cached
         except:
             pass
     return {}
@@ -368,11 +620,33 @@ def build_features_v5(df, macro_data=None, ticker="", cross_section_rank=True):
     ret = pd.Series(close, index=idx).pct_change()
     f = pd.DataFrame(index=idx)
 
-    # ─── A. 动量特征 (精简: 去掉冗余周期) ───
+    # ─── A. 动量特征 (精简: 去掉冗余周期) — v5.4: 相对SPY Alpha化 ───
+    # 之前改了目标(y=alpha)但特征还是绝对动量 → 特征-目标体系错配
+    # 现在动量特征也改为相对SPY的Alpha版本，与目标体系一致
+    spy_close = None
+    if macro_data is not None and "spy" in macro_data:
+        spy_close = macro_data["spy"].reindex(idx, method="ffill")
+    
     for p in [21, 63, 252]:
-        f[f"mom_{p}d"] = pd.Series(close, index=idx).pct_change(p)
-    mom_21 = pd.Series(close, index=idx).pct_change(21)
-    mom_63 = pd.Series(close, index=idx).pct_change(63)
+        stock_pct = pd.Series(close, index=idx).pct_change(p)
+        if spy_close is not None:
+            spy_pct = spy_close.pct_change(p)
+            # SPY数据若覆盖不到股票早期，退回到绝对动量
+            alpha = stock_pct - spy_pct
+            alpha_nan = alpha.isna()
+            stock_nan = stock_pct.isna()
+            # 只有SPY引入额外NaN时才退回
+            extra_nan = alpha_nan & ~stock_nan
+            if extra_nan.any():
+                alpha = alpha.copy()
+                alpha[extra_nan] = stock_pct[extra_nan]
+            f[f"mom_{p}d"] = alpha
+        else:
+            f[f"mom_{p}d"] = stock_pct  # 退回到绝对动量
+    
+    # mom_accel也用Alpha版本
+    mom_21 = f["mom_21d"].copy()
+    mom_63 = f["mom_63d"].copy()
     f["mom_accel"] = mom_21 - mom_63.shift(63)
 
     # ─── B. 均线偏离 (精简: 保留中长期) ───
@@ -462,6 +736,13 @@ def build_features_v5(df, macro_data=None, ticker="", cross_section_rank=True):
                 beta_vs_hsi = stock_ret.rolling(63).cov(hsi_ret) / hsi_ret.rolling(63).var().replace(0, np.nan)
                 f["beta_vs_spy"] = beta_vs_spy
                 f["beta_vs_hsi"] = beta_vs_hsi
+            # 优化4: 港股金融板块加dxy/vix因子反映利率/汇率风险
+            import re as _re
+            if sector_key == "hk_finance" or _re.match(r"0005|1299|0939|3988", ticker_guess.split(".")[0]):
+                if "dxy" in macro_data:
+                    f["macro_dxy_hkf"] = macro_data["dxy"].reindex(idx, method="ffill").pct_change(21)
+                if "vix" in macro_data:
+                    f["macro_vix_hkf"] = macro_data["vix"].reindex(idx, method="ffill").pct_change(21)
         else:
             sector_etf_map = {"tech":"xlk","finance":"xlf","energy":"xle",
                               "healthcare":"xlv","industrial":"xli",
@@ -487,10 +768,25 @@ def build_features_v5(df, macro_data=None, ticker="", cross_section_rank=True):
             aligned = macro_data["iwm"].reindex(idx, method="ffill")
             f["macro_iwm"] = aligned.pct_change(21)
 
-    # ─── 目标 (双轨) ───
-    target_5d = pd.Series(close, index=idx).pct_change(FORECAST_HORIZON_SHORT).shift(-FORECAST_HORIZON_SHORT)
-    target_21d = pd.Series(close, index=idx).pct_change(FORECAST_HORIZON_LONG).shift(-FORECAST_HORIZON_LONG)
-    # 分类目标: 1=看涨(>3%), 0=震荡, -1=看跌(<-3%)
+    # ─── 目标 (双轨) — v5.3: 改为相对SPY超额收益(Alpha) ───
+    # 个股绝对收益80%是大盘贡献的，去掉大盘因素后R²有望转正
+    stock_21d = pd.Series(close, index=idx).pct_change(FORECAST_HORIZON_LONG)
+    if macro_data and "spy" in macro_data:
+        spy_21d = macro_data["spy"].reindex(idx, method="ffill").pct_change(FORECAST_HORIZON_LONG)
+        alpha_21d = stock_21d - spy_21d  # 相对收益
+    else:
+        alpha_21d = stock_21d  # 退回到绝对收益
+    target_21d = alpha_21d.shift(-FORECAST_HORIZON_LONG)  # 前移作为预测目标
+    
+    stock_5d = pd.Series(close, index=idx).pct_change(FORECAST_HORIZON_SHORT)
+    if macro_data and "spy" in macro_data:
+        spy_5d = macro_data["spy"].reindex(idx, method="ffill").pct_change(FORECAST_HORIZON_SHORT)
+        alpha_5d = stock_5d - spy_5d
+    else:
+        alpha_5d = stock_5d
+    target_5d = alpha_5d.shift(-FORECAST_HORIZON_SHORT)
+    
+    # 分类目标: 基于相对收益（个股是否跑赢/跑输大盘±3%）
     target_cls = pd.Series(0, index=idx, dtype=int)
     target_cls[target_21d > 0.03] = 1
     target_cls[target_21d < -0.03] = -1
@@ -529,7 +825,7 @@ def train_model_walk_forward_v5(X, y_reg, y_cls, models_cfg, n_splits=TEST_SPLIT
     for name in model_names:
         # ─── 回归: 21d (自适应超参 + 时间衰减) ───
         reg_model = None
-        reg_preds = pd.Series(index=y_reg.index, dtype=np.float32)
+        reg_preds = pd.Series(index=y_reg.index, dtype=np.float64)
         fold_metrics = []
 
         for fold, (tr_idx, te_idx) in enumerate(tscv.split(X)):
@@ -545,8 +841,8 @@ def train_model_walk_forward_v5(X, y_reg, y_cls, models_cfg, n_splits=TEST_SPLIT
                 model.fit(X_tr_s, y_tr, sample_weight=sample_weight[tr_idx])
             except TypeError:
                 model.fit(X_tr_s, y_tr)  # 不支持sample_weight的模型
-            y_pred = model.predict(X_te_s)[:len(te_idx)]
-            reg_preds.iloc[te_idx] = y_pred
+            y_pred = np.asarray(model.predict(X_te_s)).ravel()
+            reg_preds.iloc[te_idx] = y_pred[:len(te_idx)]
             fold_y_true = y_reg.iloc[te_idx]
             fold_y_pred = pd.Series(y_pred, index=fold_y_true.index)
             fold_valid = fold_y_true.notna() & fold_y_pred.notna()
@@ -636,6 +932,152 @@ def train_model_walk_forward_v5(X, y_reg, y_cls, models_cfg, n_splits=TEST_SPLIT
 
 
 # ═══════════════════════════════════════
+# P0.1: 市场状态检测 + 自适应评分权重 (动置-均值回归切换)
+# ═══════════════════════════════════════
+
+def compute_adx(high, low, close, period=14):
+    """计算ADX（平均趋向指数）"""
+    n = len(high)
+    if n < period:
+        return 0
+    tr = np.maximum(high[1:] - low[1:], 
+                    np.maximum(np.abs(high[1:] - close[:-1]),
+                               np.abs(low[1:] - close[:-1])))
+    up_move = high[1:] - high[:-1]
+    down_move = low[:-1] - low[1:]
+    plus_dm = np.where((up_move > down_move) & (up_move > 0), up_move, 0)
+    minus_dm = np.where((down_move > up_move) & (down_move > 0), down_move, 0)
+    atr = np.mean(tr[-period:]) if len(tr) >= period else np.mean(tr)
+    plus_di = 100 * np.mean(plus_dm[-period:]) / atr if atr > 0 else 0
+    minus_di = 100 * np.mean(minus_dm[-period:]) / atr if atr > 0 else 0
+    dx = 100 * abs(plus_di - minus_di) / (plus_di + minus_di) if (plus_di + minus_di) > 0 else 0
+    return dx  # ADX值
+
+def detect_market_regime(close, high, low):
+    """检测市态: 'trend' / 'strong_trend' / 'sideways' / 'high_vol', 返回dict"""
+    ret = np.diff(np.log(close))
+    adx = compute_adx(high, low, close)
+    vol_21d = float(np.std(ret[-21:]) * np.sqrt(252) * 100) if len(ret) >= 21 else 0
+    vol_63d = float(np.std(ret[-63:]) * np.sqrt(252) * 100) if len(ret) >= 63 else vol_21d
+    
+    state = "neutral"
+    if adx > MARKET_REGIME_CFG.get("adx_threshold_strong_trend", 35):
+        state = "strong_trend"
+    elif adx > MARKET_REGIME_CFG.get("adx_threshold_trend", 25):
+        state = "trend"
+    else:
+        state = "sideways"
+    
+    vol_ratio = vol_21d / vol_63d if vol_63d > 0 else 1.0
+    if vol_ratio > 1.5:
+        high_vol = True
+    else:
+        high_vol = False
+    
+    return {"state": state, "high_vol": high_vol, "adx": adx, "vol_21d": vol_21d}
+
+def adjust_scores_by_regime(results, macro_data=None):
+    """根据市态调整评分集合的权重结构"""
+    if not results:
+        return results
+    cfg = MARKET_REGIME_CFG
+    if not cfg.get("enabled", True):
+        return results
+    
+    # 检测市态（使用第一只股票的数据作参考）
+    sample = results[0]
+    regime_info = sample.get("_regime_info", {})
+    state = regime_info.get("state", "trend")
+    high_vol = regime_info.get("high_vol", False)
+    
+    is_sideways = state == "sideways"
+    is_strong_trend = state == "strong_trend"
+    
+    for r in results:
+        if is_sideways:
+            # 震荡市：压缩动量权重，加大RSI/均值回归信号
+            r["_mom_mult"] = cfg.get("mean_reversion_mom_weight_mult", 0.5)
+            r["_trend_mult"] = cfg.get("mean_reversion_trend_weight_mult", 0.5)
+        elif is_strong_trend:
+            # 强趋势：加大动量/趋势权重
+            r["_mom_mult"] = cfg.get("strong_trend_mom_weight_mult", 1.3)
+            r["_trend_mult"] = cfg.get("strong_trend_trend_weight_mult", 1.5)
+        else:
+            r["_mom_mult"] = 1.0
+            r["_trend_mult"] = 1.0
+        
+        # 高波动环境：降低动量权重
+        if high_vol:
+            r["_rsi_mult"] = cfg.get("high_vol_rsi_weight_mult", 1.2)
+            r["_mom_mult"] = r.get("_mom_mult", 1.0) * cfg.get("high_vol_mom_weight_mult", 0.6)
+    
+    return results
+
+# ═══════════════════════════════════════
+# P0.2: 高频失败股惩罚机制
+# ═══════════════════════════════════════
+
+def load_stock_penalties():
+    """从文件加载失败股惩罚记录"""
+    path = os.path.expanduser(STOCK_PENALTY_CFG.get("penalty_file", "~/.cache/hermes-quant/stock_penalties.json"))
+    if os.path.exists(path):
+        try:
+            with open(path) as f:
+                return json.load(f)
+        except:
+            pass
+    return {"penalties": {}, "updated": datetime.now().isoformat()}
+
+def save_stock_penalties(data):
+    """保存失败股惩罚记录"""
+    path = os.path.expanduser(STOCK_PENALTY_CFG.get("penalty_file", "~/.cache/hermes-quant/stock_penalties.json"))
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "w") as f:
+        json.dump(data, f, indent=2)
+
+def get_penalty_for_ticker(ticker, stock_penalties):
+    """获取某只股票的当前惩罚系数 (0=无惩罚, 最大值来自配置)"""
+    cfg = STOCK_PENALTY_CFG
+    if not cfg.get("enabled", True):
+        return 0
+    pdata = stock_penalties.get("penalties", {}).get(ticker, {})
+    if not pdata:
+        return 0
+    failures = pdata.get("consecutive_high_conf_failures", 0)
+    max_penalty = cfg.get("max_penalty", 0.15)
+    penalty_per = cfg.get("penalty_per_failure", 0.04)
+    threshold = cfg.get("consecutive_failures_threshold", 2)
+    if failures < threshold:
+        return 0
+    penalty = min(failures * penalty_per, max_penalty)
+    return penalty
+
+def apply_score_spread(scores):
+    """评分展宽: 拉大评分间距"""
+    cfg = SCORE_SPREAD_CFG
+    if not cfg.get("enabled", True):
+        return scores
+    method = cfg.get("method", "power")
+    exponent = cfg.get("power_exponent", 1.3)
+    min_s = cfg.get("min_score", 0.0)
+    max_s = cfg.get("max_score", 1.0)
+    if not scores:
+        return scores
+    arr = np.array(scores)
+    # 归一化到0-1
+    lo, hi = arr.min(), arr.max()
+    if hi - lo < 0.01:
+        return scores
+    norm = (arr - lo) / (hi - lo)
+    if method == "power":
+        expanded = norm ** exponent
+    else:
+        expanded = norm
+    # 缩放回原始区间
+    result = expanded * (hi - lo) + lo
+    return result.tolist()
+
+# ═══════════════════════════════════════
 # P0.1: 个股评分 v5 (Rank一致性)
 # ═══════════════════════════════════════
 
@@ -687,13 +1129,17 @@ def _momentum_direction_fallback(close_series, df_used):
         return "震荡"
 
 def score_stock_v5(ticker, macro_data=None, period="2y", force_refresh=False):
-    """v5.2 个股评分: Rank一致性评分 + 双轨预测 + 自适应窗口"""
+    """v5.2 个股评分: Rank一致性评分 + 双轨预测 + 自适应窗口 + 市态检测"""
     df = get_cached_data(ticker, period=period, force_refresh=force_refresh)
     if df.empty or len(df) < MIN_TRADING_DAYS:
         return None
 
     if isinstance(df.columns, pd.MultiIndex):
         df.columns = [c[0] for c in df.columns]
+
+    # 统一时区: 缓存文件可能来自 Ticker.history() (带时区) 或 yf.download (无时区)
+    if hasattr(df.index, 'tz') and df.index.tz is not None:
+        df.index = df.index.tz_localize(None)
 
     # ─── P1c: 自适应窗口 (v5.2: 根据波动率动态选择) ───
     if len(df) > min(ADAPTIVE_WINDOWS):
@@ -703,12 +1149,10 @@ def score_stock_v5(ticker, macro_data=None, period="2y", force_refresh=False):
         # 计算历史波动率百分位
         hist_vols = ret_full.rolling(63).std().dropna() * np.sqrt(252)
         if len(hist_vols) > 20:
-            vol_pctl = (vol_21d < hist_vols).mean()  # 当前波动率在历史中的百分位
+            vol_pctl = (vol_21d < hist_vols).mean()
             if vol_pctl > 0.7:
-                # 高波动 → 短窗口 (更敏感)
                 best_w = 504
             elif vol_pctl < 0.3:
-                # 低波动 → 长窗口 (更稳定)
                 best_w = 1008 if 1008 <= len(df) else (756 if 756 <= len(df) else 504)
             else:
                 best_w = 756 if 756 <= len(df) else (504 if 504 <= len(df) else len(df))
@@ -718,6 +1162,12 @@ def score_stock_v5(ticker, macro_data=None, period="2y", force_refresh=False):
     else:
         df_used = df
         best_w = len(df_used)
+
+    # ─── 市态检测 (优化1) ───
+    close_arr = df_used["Close"].values.astype(float)
+    high_arr = df_used["High"].values.astype(float)
+    low_arr = df_used["Low"].values.astype(float)
+    regime_info = detect_market_regime(close_arr, high_arr, low_arr)
 
     features, target_5d, target_21d, target_cls = build_features_v5(df_used, macro_data, ticker)
     if len(features) < WARMUP:
@@ -737,6 +1187,18 @@ def score_stock_v5(ticker, macro_data=None, period="2y", force_refresh=False):
     # 强制对齐 (双重保护)
     X = X.loc[y_reg.index]
     y_cls = y_cls.loc[X.index]
+    
+    # ─── 捕获特征值快照（供 data_archiver 回测归档） ───
+    _latest_features = {}
+    if len(X) > 0:
+        latest = X.iloc[-1]
+        for col in X.columns:
+            val = latest[col]
+            if pd.notna(val) and not isinstance(val, (np.ndarray, pd.Series)):
+                try:
+                    _latest_features[col] = round(float(val), 6) if isinstance(val, (np.floating, float)) else val
+                except (ValueError, TypeError):
+                    pass
     
     # 训练
     results, scaler = train_model_walk_forward_v5(
@@ -772,22 +1234,39 @@ def score_stock_v5(ticker, macro_data=None, period="2y", force_refresh=False):
     # 4. 最终评分 = 最新ensemble排名百分位 + 动量兜底
     latest_rank = float(rank_df.iloc[-1].mean())  # 各模型排名均值
     
-    # ─── P1b: EMA平滑动量兜底 ───
+    # ─── P1b: EMA平滑动量兜底 + 市态调整 ───
     closes = df_used["Close"].values.astype(float)
     close_series = pd.Series(closes)
     ema_21 = close_series.ewm(span=21).mean()
     ema_63 = close_series.ewm(span=63).mean()
     mom_21d_val = (ema_21.iloc[-1] / ema_21.iloc[-22] - 1) if len(ema_21) >= 22 else 0
     mom_63d_val = (ema_63.iloc[-1] / ema_63.iloc[-64] - 1) if len(ema_63) >= 64 else 0
-    
     avg_r2 = np.mean([results[n]["reg_r2"] for n in model_names])
+
+    # 市态信息（供adjust_scores_by_regime使用）
+    mom_mult = 1.0
+    trend_mult = 1.0
+    state = regime_info.get("state", "trend")
+    high_vol = regime_info.get("high_vol", False)
+    if state == "sideways":
+        mom_mult = MARKET_REGIME_CFG.get("mean_reversion_mom_weight_mult", 0.5)
+        trend_mult = MARKET_REGIME_CFG.get("mean_reversion_trend_weight_mult", 0.5)
+    elif state == "strong_trend":
+        mom_mult = MARKET_REGIME_CFG.get("strong_trend_mom_weight_mult", 1.3)
+        trend_mult = MARKET_REGIME_CFG.get("strong_trend_trend_weight_mult", 1.5)
+    if high_vol:
+        mom_mult *= MARKET_REGIME_CFG.get("high_vol_mom_weight_mult", 0.6)
+
+    # 市态调整后的动量兜底
     if avg_r2 < 0:
-        mom_score = max(0, min(1, (mom_21d_val * CFG["momentum_fallback"]["mom_21d_weight"] + mom_63d_val * CFG["momentum_fallback"]["mom_63d_weight"] + CFG["momentum_fallback"]["mom_score_offset"])))
+        adjusted_mom_21d = mom_21d_val * mom_mult
+        adjusted_mom_63d = mom_63d_val * mom_mult
+        mom_score = max(0, min(1, (adjusted_mom_21d * CFG["momentum_fallback"]["mom_21d_weight"] + adjusted_mom_63d * CFG["momentum_fallback"]["mom_63d_weight"] + CFG["momentum_fallback"]["mom_score_offset"])))
         mom_weight = min(max(-avg_r2 * CFG["momentum_fallback"]["r2_to_weight_multiplier"], CFG["momentum_fallback"]["weight_min"]), CFG["momentum_fallback"]["weight_max"])
         final_rank = latest_rank * (1 - mom_weight) + mom_score * mom_weight
     else:
         final_rank = latest_rank
-    
+
     final_score = final_rank * CFG["score_formula"]["rank_weight"] + confidence * CFG["score_formula"]["confidence_weight"]
     
     # 5. 分类信号 (v5.2: ensemble投票方向)
@@ -820,6 +1299,12 @@ def score_stock_v5(ticker, macro_data=None, period="2y", force_refresh=False):
             else:
                 direction = "震荡"
             direction_source = "cls_ensemble"
+            
+            # ─── Fix4: 低信噪比保守模式 — 如果R²严重为负且置信度低, 记录状态不强制震荡
+            # (注意: 批次级的保守模式会在run_ml_picking_v5()中用动量方向整体覆盖)
+            if avg_r2 < -0.5 and confidence < 0.3 and direction != "震荡":
+                # 标记为低信噪比，批次级处理时会整体用动量覆盖
+                direction_source = "cls_low_snr"
         else:
             # 动量方向兜底: 分类器无信号时, 用EMA平滑动量判断方向
             fallback_direction = _momentum_direction_fallback(close_series, df_used)
@@ -866,6 +1351,11 @@ def score_stock_v5(ticker, macro_data=None, period="2y", force_refresh=False):
         "models_consensus": round(confidence, 4),
         "sector": get_ticker_sector(ticker),
         "direction_source": direction_source,
+        "_regime_info": regime_info,
+        "_mom_mult": mom_mult,
+        "_trend_mult": trend_mult,
+        "_avg_r2": float(avg_r2) if isinstance(avg_r2, (int, float)) else 0,
+        "_latest_features": _latest_features,
     }
 
 
@@ -876,7 +1366,10 @@ def run_ml_picking_v5(tickers=None, market="US", macro_data=None,
                        force_refresh=False, top_n=TOP_N, verbose=True):
     """v5 批量选股"""
     if tickers is None:
-        tickers = US_WATCHLIST
+        if market == "HK":
+            tickers = HK_WATCHLIST
+        else:
+            tickers = US_WATCHLIST
     
     label = market
     
@@ -918,6 +1411,87 @@ def run_ml_picking_v5(tickers=None, market="US", macro_data=None,
         # 防限流: 每只股票之间短暂间隔, 给YF缓存喘息时间
         if i < total - 1:
             time.sleep(0.15)
+
+    results.sort(key=lambda x: x["score"], reverse=True)
+
+    # ─── 计算全体R²指标 ───
+    all_r2 = [r.get("walk_forward_r2", 0) or r.get("_avg_r2", 0) for r in results]
+    neg_r2_ratio = sum(1 for r2 in all_r2 if r2 < 0) / len(all_r2) if all_r2 else 0
+    avg_all_r2 = np.mean(all_r2) if all_r2 else 0
+    low_snr_mode = neg_r2_ratio > 0.8 or avg_all_r2 < -0.8
+
+    # ─── R²全负保守模式: 方向脱钩分类器, 改用动量兜底 ───
+    if low_snr_mode:
+        if verbose:
+            print(f"  🛡️  R²全负({neg_r2_ratio:.0%} avg_R²={avg_all_r2:.2f}) 保守模式")
+        for r in results:
+            direction_source = r.get("direction_source", "")
+            # 只覆盖来自分类器的方向（cls_ensemble和cls_low_snr），
+            # momentum_fallback和no_model等非分类器来源保留不变
+            if direction_source in ("cls_ensemble", "cls_low_snr"):
+                m1 = r.get("mom_1m", 0) or 0
+                m3 = r.get("mom_3m", 0) or 0
+                orig_dir = r.get("direction", "震荡")
+                mom_accel = m1 - m3 * (abs(m3) / max(abs(m3), 5)) if abs(m3) > 1 else m1  # 动量加速度
+                # 规则1: 动量陷阱检测
+                if m3 > 15 and m1 < -8 and orig_dir != "看跌":
+                    r["direction"] = "看跌"
+                    r["direction_source"] = "low_snr_momentum_trap"
+                    if verbose:
+                        print(f"    🔻 {r['ticker']}: 动量陷阱({m1:+.0f}%1m/{m3:+.0f}%3m) {orig_dir}→看跌")
+                # 规则2: 动量修复检测
+                elif m3 < -15 and m1 > 8 and orig_dir != "看涨":
+                    r["direction"] = "看涨"
+                    r["direction_source"] = "low_snr_momentum_recovery"
+                    if verbose:
+                        print(f"    🔺 {r['ticker']}: 动量修复({m1:+.0f}%1m/{m3:+.0f}%3m) {orig_dir}→看涨")
+                # 规则3: 强看涨(双月均>5%)却看跌 → 改为看涨
+                elif orig_dir == "看跌" and m1 > 5 and m3 > 5:
+                    r["direction"] = "看涨"
+                    r["direction_source"] = "low_snr_correct_bull"
+                # 规则4: 强看跌(1m<-8%且3m<-8%)却看涨 → 改为看跌
+                elif orig_dir == "看涨" and m1 < -8 and m3 < -8:
+                    r["direction"] = "看跌"
+                    r["direction_source"] = "low_snr_correct_bear"
+                else:
+                    # 保留原方向，但标记为低信噪比来源
+                    r["direction_source"] = "low_snr_cls"
+
+    # ─── 后处理：评分展宽 (优化3) — R²全负时禁用 ───
+    score_spread_enabled = SCORE_SPREAD_CFG.get("enabled", True)
+    if score_spread_enabled and len(results) > 1:
+        if neg_r2_ratio > 0.8 or avg_all_r2 < -1.0:
+            # R²全负时禁用评分展宽——展宽在噪声环境下只会放大错误信号的区分度
+            if verbose:
+                print(f"  ⚠️  R²全负率{neg_r2_ratio:.0%} avg_R²={avg_all_r2:.2f}，评分展宽已禁用")
+        else:
+            scores = [r["score"] for r in results]
+            expanded = apply_score_spread(scores)
+            for i, r in enumerate(results):
+                r["score"] = expanded[i]
+
+    # ─── 后处理：市场状态批量调整 (优化1) + 改进(优化6) ───
+    results = adjust_scores_by_regime(results, macro_data)
+
+    # 改进: 震荡市+高波动 → 反转因子加强（额外调低动量权重）
+    if results:
+        sample = results[0]
+        state = sample.get("_regime_info", {}).get("state", "trend")
+        high_vol = sample.get("_regime_info", {}).get("high_vol", False)
+        if state == "sideways" and high_vol:
+            if verbose:
+                print("  🔄 震荡+高波动市态: 强化反转因子(动量权重额外×0.7)")
+            for r in results:
+                r["_mom_mult"] = r.get("_mom_mult", 1.0) * 0.7
+
+    # ─── 后处理：失败股惩罚 (优化2) ───
+    if STOCK_PENALTY_CFG.get("enabled", True):
+        stock_penalties = load_stock_penalties()
+        for r in results:
+            penalty = get_penalty_for_ticker(r["ticker"], stock_penalties)
+            if penalty > 0:
+                r["score"] = max(0, r["score"] - penalty)
+                r["_penalty"] = penalty
 
     results.sort(key=lambda x: x["score"], reverse=True)
     return results, errors

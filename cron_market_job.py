@@ -20,6 +20,13 @@ from datetime import datetime, timedelta
 # 添加当前目录到路径
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
+# ─── 数据归档（回测支持） ───
+try:
+    from data_archiver import full_archive_from_run, archive_review, archive_batch_raw_data, archive_daily_detail
+    HAS_ARCHIVER = True
+except ImportError:
+    HAS_ARCHIVER = False
+
 # ─── 路径配置 ───
 CACHE_DIR = os.path.expanduser("~/.cache/hermes-quant")
 STATE_DIR = os.path.join(CACHE_DIR, "market_jobs")
@@ -51,6 +58,23 @@ TUNE_PRESETS = {
     "auto_reduce_low": {
         "desc": "准确率低, 大幅降低confidence比重",
         "steps": [0.15, 0.10, 0.07, 0.05],
+    },
+    # ─── 方向阈值自适应预设 (Fix1/Fix4) ───
+    "widen_bias_bearish": {
+        "desc": "连续偏看跌, 调低看跌阈值",
+        "steps": [{"bearish": -0.25}, {"bearish": -0.30}],
+    },
+    "widen_bias_bullish": {
+        "desc": "连续偏看涨, 调高看涨阈值",
+        "steps": [{"bullish": 0.25}, {"bullish": 0.30}],
+    },
+    "widen_all": {
+        "desc": "低信噪比, 放宽双向阈值",
+        "steps": [{"bullish": 0.25, "bearish": -0.25}],
+    },
+    "reset_bias": {
+        "desc": "偏差已消除, 恢复默认阈值",
+        "steps": [{"bullish": 0.15, "bearish": -0.15}],
     },
 }
 
@@ -270,6 +294,15 @@ def run_pre_market(market, sentiment=False):
 
     print(f"  ✅ {label}开市前预测完成!")
 
+    # ─── 数据归档（回测支持） ───
+    if HAS_ARCHIVER:
+        try:
+            v5 = load_v5_module()
+            macro_data = v5.get("get_macro_data")()
+            full_archive_from_run(market, predictions, macro_data)
+        except Exception as e:
+            print(f"  ⚠️ 归档失败: {e}")
+
 
 # ═══════════════════════════════════════
 # Post-Market: 收市后复盘对比
@@ -306,6 +339,7 @@ def run_post_market(market, sentiment=False):
 
     # 下载今日收盘数据对比
     compare = []
+    raw_data_buffer = []  # 收集原始行情供归档
     errors = []
     for i, p in enumerate(predictions):
         ticker = p["ticker"]
@@ -317,26 +351,46 @@ def run_post_market(market, sentiment=False):
             if isinstance(df.columns, pd.MultiIndex):
                 df.columns = [c[0] for c in df.columns]
 
-            # 获取今日收盘涨跌幅
+            # 获取相对涨跌幅: 使用5日涨跌幅平滑单日噪声，对齐预测目标周期
             closes = df["Close"].values.astype(float)
             if len(closes) < 2:
                 errors.append(ticker)
                 continue
-            today_chg = (closes[-1] / closes[-2] - 1) * 100
+            # 5日涨跌幅（平滑单日噪声，对齐5~21天预测目标）
+            if len(closes) >= 6:
+                chg_1d = (closes[-1] / closes[-2] - 1) * 100
+                chg_5d = (closes[-1] / closes[-6] - 1) * 100
+                review_chg = chg_5d  # 使用5日作为主要评价指标
+            else:
+                chg_1d = (closes[-1] / closes[-2] - 1) * 100
+                chg_5d = chg_1d
+                review_chg = chg_1d
+            
+            # SPY相对收益（alpha）
+            try:
+                spy_df = get_cached("SPY", period="1y", force_refresh=False)
+                if not spy_df.empty and len(spy_df) >= 6:
+                    spy_closes = spy_df["Close"].values.astype(float)
+                    spy_5d = (spy_closes[-1] / spy_closes[-6] - 1) * 100
+                    alpha_5d = chg_5d - spy_5d
+                else:
+                    alpha_5d = 0
+            except:
+                alpha_5d = 0
 
-            # 判断方向是否正确
+            # 判断方向是否正确（基于5日涨跌幅）—— 阈值±1.5%避免过窄判定
             pred_dir = p["direction"]
-            if today_chg > 0.5:
+            if review_chg > 1.5:
                 actual_dir = "看涨"
-            elif today_chg < -0.5:
+            elif review_chg < -1.5:
                 actual_dir = "看跌"
             else:
                 actual_dir = "震荡"
 
             correct = (
                 (pred_dir == actual_dir) or
-                (pred_dir == "看涨" and today_chg > 0) or
-                (pred_dir == "看跌" and today_chg < 0)
+                (pred_dir == "看涨" and review_chg > 0) or
+                (pred_dir == "看跌" and review_chg < 0)
             )
 
             compare.append({
@@ -344,12 +398,16 @@ def run_post_market(market, sentiment=False):
                 "name": p.get("name", ticker),
                 "score": p["score"],
                 "pred_dir": pred_dir,
-                "actual_chg": round(today_chg, 2),
+                "actual_chg": round(chg_1d, 2),   # 单日涨跌幅保留供参考
+                "chg_5d": round(chg_5d, 2),       # 5日涨跌幅
+                "alpha_5d": round(alpha_5d, 4),   # 5日超额收益
                 "actual_dir": actual_dir,
                 "correct": correct,
                 "price": p.get("price", 0),
                 "sector": p.get("sector", "other"),
             })
+            # 收集原始行情（归档用，后续批量写入）
+            raw_data_buffer.append((ticker, df))
         except Exception as e:
             errors.append(f"{ticker}: {e}")
 
@@ -400,13 +458,51 @@ def run_post_market(market, sentiment=False):
             "detail": f"准确率{accuracy:.0%}，仍有改进空间。建议检查模型是否过度依赖少数特征",
         })
 
-    # 2. 方向偏差
+    # 2. 方向偏差 — 含连续2天自适应阈值调整
     if bias:
         suggestions.append({
             "type": "direction_bias",
             "severity": "high",
             "detail": f"系统存在{bias}。建议：①检查21d分类器的看跌阈值 ②确认是否有政策/消息面利好",
         })
+        # 检查上次是否有方向偏差 → 连续2天则自动调宽阈值
+        last_opt = state.get("optimizations", [])
+        last_bias = None
+        if last_opt:
+            for o in reversed(last_opt):
+                if o.get("bias"):
+                    last_bias = o.get("bias")
+                    break
+        if last_bias and ("偏看跌" in str(bias)) == ("偏看跌" in str(last_bias)):
+            bias_type = "bearish" if "偏看跌" in str(bias) else "bullish"
+            widen_preset = f"widen_bias_{bias_type}"
+            print(f"  ⚠️  连续2天方向偏差({bias_type})，自动调宽阈值")
+            config_changes.append({
+                "keys": ["ml_scoring", "direction_thresholds"],
+                "old": None,
+                "new": widen_preset,
+                "reason": f"连续2天{bias_type}偏差, 阈值±0.15→±0.25"
+            })
+            actions_taken.append(f"调宽{bias_type}阈值(连续2天偏差)")
+            # 实际在state中记录
+            state.setdefault("_bias_adapt", {})
+            state["_bias_adapt"]["last_type"] = bias_type
+            state["_bias_adapt"]["consecutive_count"] = state.get("_bias_adapt", {}).get("consecutive_count", 0) + 1
+        else:
+            state["_bias_adapt"] = {"last_type": "偏看跌" if "偏看跌" in str(bias) else "bullish" if "偏看涨" in str(bias) else "", "consecutive_count": 1}
+    else:
+        # 无偏差 → 检查是否需要恢复
+        prev_consecutive = state.get("_bias_adapt", {}).get("consecutive_count", 0)
+        if prev_consecutive >= 2:
+            # 之前的偏差已消除, 恢复默认阈值
+            config_changes.append({
+                "keys": ["ml_scoring", "direction_thresholds"],
+                "old": None,
+                "new": "reset_bias",
+                "reason": f"偏差已消除, 恢复默认阈值±0.15"
+            })
+            actions_taken.append("恢复默认方向阈值(偏差已消除)")
+        state["_bias_adapt"] = {}
 
     # 3. 板块准确率
     sectors = {}
@@ -501,6 +597,38 @@ def run_post_market(market, sentiment=False):
             print(f"\n  [{s['severity'].upper()}] {s['type']}")
             print(f"  {s['detail']}")
 
+        # ─── Fix4: 低信噪比自检 — 如果R²全负+准确率<40%,建议增加震荡信号 ───
+        # 检查预测记录中是否有R²信息
+        neg_r2_ratio_in_predictions = 0
+        pred_r2s = [pp.get("walk_forward_r2", 0) or pp.get("_avg_r2", 0) for pp in predictions if pp.get("walk_forward_r2") is not None or pp.get("_avg_r2") is not None]
+        if pred_r2s:
+            neg_r2_ratio_in_predictions = sum(1 for r2 in pred_r2s if r2 < 0) / len(pred_r2s)
+        
+        if accuracy < 0.40 and neg_r2_ratio_in_predictions > 0.7:
+            # 低信噪比环境：建议增加震荡输出
+            dir_counts = {}
+            for pp in predictions:
+                d = pp.get("direction", "未知")
+                dir_counts[d] = dir_counts.get(d, 0) + 1
+            has_few_neutral = dir_counts.get("震荡", 0) < len(predictions) * 0.2
+            
+            if has_few_neutral:
+                suggestions.append({
+                    "type": "low_snr_recommendation",
+                    "severity": "high",
+                    "detail": f"R²负率{neg_r2_ratio_in_predictions:.0%}+准确率{accuracy:.0%}低于40%, "
+                              f"属于低信噪比环境。当前震荡信号仅{dir_counts.get('震荡',0)}/{len(predictions)}只。"
+                              f"建议启用保守模式：方向不明确时输出震荡/观望"
+                })
+                config_changes.append({
+                    "keys": ["ml_scoring", "direction_thresholds"],
+                    "old": None,
+                    "new": "widen_all",
+                    "reason": f"低信噪比(R²负率{neg_r2_ratio_in_predictions:.0%}), "
+                              f"阈值放宽从±0.15→±0.25减少噪声方向输出"
+                })
+                actions_taken.append("放宽方向阈值(低信噪比模式)")
+
         # 自动调整：根据问题类型生成结构化配置修改
         for s in suggestions:
             if s["type"] == "moderate_accuracy" and accuracy < 0.5:
@@ -547,6 +675,30 @@ def run_post_market(market, sentiment=False):
     })
     save_state(market, state)
 
+    # ─── 记录失败股惩罚 (优化2) ───
+    try:
+        penalty_path = os.path.expanduser("~/.cache/hermes-quant/stock_penalties.json")
+        pdata = {"penalties": {}, "updated": today}
+        if os.path.exists(penalty_path):
+            with open(penalty_path) as f:
+                pdata = json.load(f)
+        for c in compare:
+            ticker = c["ticker"]
+            p = pdata.setdefault("penalties", {}).setdefault(ticker, {"consecutive_high_conf_failures": 0, "last_date": ""})
+            if c.get("score", 0) > 0.5 and not c["correct"]:
+                p["consecutive_high_conf_failures"] = p.get("consecutive_high_conf_failures", 0) + 1
+                p["last_date"] = today
+                p["last_score"] = c["score"]
+                p["last_error"] = f"pred={c['pred_dir']} actual={c['actual_chg']:+.2f}%"
+            elif c["correct"]:
+                p["consecutive_high_conf_failures"] = max(0, p.get("consecutive_high_conf_failures", 0) - 1)
+        pdata["updated"] = today
+        os.makedirs(os.path.dirname(penalty_path), exist_ok=True)
+        with open(penalty_path, "w") as f:
+            json.dump(pdata, f, indent=2)
+    except Exception:
+        pass
+
     # ─── 实际应用代码修改 ───
     for change in config_changes:
         _apply_v5_change(change, state, today)
@@ -560,16 +712,31 @@ def run_post_market(market, sentiment=False):
         print(f"\n  📰 复盘情绪 + 异常事件检测...")
         try:
             from finbert_sentiment import build_sentiment_factors, sentiment_boost
+            import numpy as np
 
             all_tickers = [p["ticker"] for p in predictions]
             sentiment_factors = build_sentiment_factors(all_tickers)
 
-            for p in predictions:
+            # ─── 预计算所有情绪信号用于横截面去偏 ───
+            cross_section_raw = []
+            for t in all_tickers:
+                sf = sentiment_factors.get(t, {})
+                if sf and sf.get("news_count", 0) > 0:
+                    sig = sf.get("sentiment_score", 0) * 0.4
+                    sig += sf.get("recent_direction", 0) * 0.3
+                    sig += (sf.get("sentiment_urgency", 0) - 0.5) * 0.3
+                    cross_section_raw.append(sig)
+                else:
+                    cross_section_raw.append(None)
+
+            for idx, p in enumerate(predictions):
                 t = p["ticker"]
                 sf = sentiment_factors.get(t, {})
                 if sf and sf.get("news_count", 0) > 0:
                     original = p["score"]
                     fused, adj, evt_adj = sentiment_boost(original, sf)
+                    # 用sentiment_boost_v2的cross_section参数（通过sentiment_boost代理）
+                    # 改用直接import v2版本
                     p["score"] = fused
                     p["sentiment_adj"] = adj
                     p["event_adj"] = evt_adj
@@ -577,6 +744,29 @@ def run_post_market(market, sentiment=False):
                         print(f"      {t}: {original:.3f} → {fused:.3f}"
                               f"{f' (情绪{adj:+.3f})' if abs(adj) > 0.01 else ''}"
                               f"{f' (事件{evt_adj:+.3f})' if abs(evt_adj) > 0.01 else ''}")
+
+            # ─── 用v2版本带横截面去偏重新跑一次 ───
+            if len([s for s in cross_section_raw if s is not None]) > 3:
+                from finbert_sentiment import sentiment_boost_v2
+                print("  📐 应用横截面情绪去偏(z-score标准化)...")
+                for idx, p in enumerate(predictions):
+                    t = p["ticker"]
+                    sf = sentiment_factors.get(t, {})
+                    if sf and sf.get("news_count", 0) > 0:
+                        original_before_debias = p["score"]
+                        fused2, adj2, evt_adj2 = sentiment_boost_v2(
+                            original_before_debias, sf,
+                            cross_section_signals=cross_section_raw
+                        )
+                        if abs(adj2 - p.get("sentiment_adj", 0)) > 0.005:
+                            p["score"] = fused2
+                            p["sentiment_adj"] = adj2
+                            p["event_adj"] = evt_adj2
+                            print(f"      {t}: 去偏后 {original_before_debias:.3f} → {fused2:.3f}"
+                                  f"{f' (情绪{adj2:+.3f})' if abs(adj2) > 0.005 else ''}")
+
+            # 修正：sentiment修改后重新保存state
+            save_state(market, state)
 
             # 输出事件检测摘要
             all_events = [(t, sf) for t, sf in sentiment_factors.items()
@@ -615,6 +805,25 @@ def run_post_market(market, sentiment=False):
             print(f"    ✅ {a}")
     else:
         print(f"\n  🟢 当前设置运行正常，未执行自动修改")
+
+    # ─── 数据归档（回测支持） ───
+    if HAS_ARCHIVER:
+        try:
+            if raw_data_buffer:
+                raw_count = archive_batch_raw_data(market, raw_data_buffer)
+                if raw_count > 0:
+                    print(f"  📦 行情归档: {raw_count} 只")
+                    from data_archiver import update_stats
+                    update_stats(market, pred_count=0, raw_count=raw_count)
+            # 归档逐只股票对比明细
+            detail_count = archive_daily_detail(market, compare)
+            if detail_count > 0:
+                print(f"  📊 对比明细: {detail_count} 条")
+                from data_archiver import update_stats
+                update_stats(market, detail_count=detail_count)
+            archive_review(market, opt_record)
+        except Exception as e:
+            print(f"  ⚠️ 复盘归档失败: {e}")
 
     return opt_record
 
@@ -668,7 +877,7 @@ def _apply_v5_change(change, state=None, today=None):
         return
 
     # 预设调优: 根据历史调节记录自动降级
-    if isinstance(new_val, str) and new_val.startswith("auto_"):
+    if isinstance(new_val, str) and (new_val.startswith("auto_") or new_val in ("widen_bias_bearish", "widen_bias_bullish", "widen_all", "reset_bias")):
         preset = TUNE_PRESETS.get(new_val)
         if preset:
             tune_key = ".".join(keys)
@@ -676,22 +885,30 @@ def _apply_v5_change(change, state=None, today=None):
             prev_idx = -1
             for h in history:
                 if h.get("key") == tune_key:
-                    prev_idx = h.get("step_index", -1)  # 取最后一条匹配记录
+                    prev_idx = h.get("step_index", -1)
             step_idx = prev_idx + 1
             if step_idx >= len(preset["steps"]):
                 step_idx = len(preset["steps"]) - 1
             new_val = preset["steps"][step_idx]
             change["step_index"] = step_idx
 
-    # 写入配置
+    # 写入配置 (支持 dict 类型新值)
     target = cfg
     for k in keys[:-1]:
-        target = target.setdefault(k, {})  # 确保中间路径存在
-    old_str = str(target.get(keys[-1], "?"))
-    target[keys[-1]] = new_val
+        target = target.setdefault(k, {})
+    
+    if isinstance(new_val, dict):
+        # dict类型: 只更新指定子键 (用于方向阈值)
+        for sub_key, sub_val in new_val.items():
+            old_sub = str(target.get(keys[-1], {}).get(sub_key, "?"))
+            target.setdefault(keys[-1], {})[sub_key] = sub_val
+            print(f"  ✅ 配置更新: {'.'.join(keys)} > {sub_key}: {old_sub} -> {sub_val}")
+    else:
+        # 标量类型: 直接替换
+        old_str = str(target.get(keys[-1], "?"))
+        target[keys[-1]] = new_val
+        print(f"  ✅ 配置更新: {' > '.join(keys)}: {old_str} -> {new_val}")
     _save_config(cfg)
-
-    print(f"  \u2705 \u914d\u7f6e\u66f4\u65b0: {' > '.join(keys)}: {old_str} -> {new_val}")
     if reason:
         print(f"     \u539f\u56e0: {reason}")
 

@@ -4,7 +4,7 @@
   "ml_scoring": {
     "top_n": 20,
     "min_trading_days": 200,
-    "test_splits": 4,
+    "test_splits": 3,
     "forecast_horizon_short": 21,
     "forecast_horizon_long": 21,
     "forecast_horizon_mom": 63,
@@ -18,17 +18,17 @@
     "cache_refresh_hours": 8,
     "score_formula": {
       "rank_weight": 0.85,
-      "confidence_weight": 0.15
+      "confidence_weight": 0.08
     },
     "sentiment": {
       "weight": 0.15,
       "event_discount_base": 0.85,
-      "event_min_keep": 0.10,
+      "event_min_keep": 0.1,
       "event_direction_penalty": 0.3
     },
     "direction_thresholds": {
-      "bullish": 0.15,
-      "bearish": -0.15
+      "bullish": 0.3,
+      "bearish": -0.25
     },
     "momentum_fallback": {
       "mom_21d_weight": 0.6,
@@ -45,6 +45,46 @@
     "confidence": {
       "default_fallback": 0.3,
       "min_confidence": 0.2
+    },
+    "market_regime": {
+      "enabled": true,
+      "adx_threshold_trend": 25,
+      "adx_threshold_strong_trend": 35,
+      "bb_width_percentile_high": 0.8,
+      "bb_width_percentile_low": 0.2,
+      "mean_reversion_mom_weight_mult": 0.5,
+      "mean_reversion_trend_weight_mult": 0.5,
+      "strong_trend_mom_weight_mult": 1.3,
+      "strong_trend_trend_weight_mult": 1.5,
+      "high_vol_rsi_weight_mult": 1.2,
+      "high_vol_mom_weight_mult": 0.6
+    },
+    "stock_penalty": {
+      "enabled": true,
+      "penalty_file": "~/.cache/hermes-quant/stock_penalties.json",
+      "consecutive_failures_threshold": 2,
+      "high_conf_threshold": 0.5,
+      "max_penalty": 0.15,
+      "penalty_per_failure": 0.04,
+      "decay_days": 5
+    },
+    "score_spread": {
+      "enabled": true,
+      "method": "power",
+      "power_exponent": 1.3,
+      "min_score": 0.0,
+      "max_score": 1.0
+    },
+    "sentiment_v2": {
+      "enabled": true,
+      "min_signal_threshold": 0.03,
+      "strong_signal_threshold": 0.1,
+      "base_weight": 0.15,
+      "weak_signal_weight": 0.05,
+      "strong_signal_weight": 0.3,
+      "event_discount_base": 0.85,
+      "event_min_keep": 0.1,
+      "event_direction_penalty": 0.3
     }
   },
   "cross_validate": {

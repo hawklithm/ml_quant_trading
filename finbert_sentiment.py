@@ -28,6 +28,7 @@ import os
 import re
 import sys
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 
 import numpy as np
@@ -799,16 +800,17 @@ def deep_sentiment(ticker, news_list):
 # ═══════════════════════════════════════
 # 4. 生成情绪因子
 # ═══════════════════════════════════════
-def build_sentiment_factors(tickers):
-    """生成情绪因子字典 {ticker: {factor1: val, ...}}"""
+def build_sentiment_factors(tickers, max_workers=5):
+    """生成情绪因子字典 {ticker: {factor1: val, ...}}
+    
+    使用 ThreadPoolExecutor 并行对多只股票做情绪分析（默认5路并发）。
+    """
     news_data = fetch_batch_news(tickers)
 
-    factors = {}
-    for t in tickers:
-        news = news_data.get(t, [])
-        sa = deep_sentiment(t, news)
-
-        factors[t] = {
+    def _analyze_one(ticker):
+        news = news_data.get(ticker, [])
+        sa = deep_sentiment(ticker, news)
+        return ticker, {
             "sentiment_score": sa["sentiment_score"],
             "sentiment_urgency": sa["sentiment_urgency"],
             "sentiment_consistency": sa["sentiment_consistency"],
@@ -820,68 +822,112 @@ def build_sentiment_factors(tickers):
             "event_discount": sa["event_discount"],
             "event_labels": sa["event_labels"],
         }
+
+    factors = {}
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        futures = {executor.submit(_analyze_one, t): t for t in tickers}
+        for future in as_completed(futures):
+            try:
+                ticker, result = future.result()
+                factors[ticker] = result
+            except Exception as e:
+                ticker = futures[future]
+                print(f"  ⚠️  {ticker} 情绪分析失败: {e}")
+                # 兜底：返回中性情绪因子
+                factors[ticker] = {
+                    "sentiment_score": 0.0, "sentiment_urgency": 0.0,
+                    "sentiment_consistency": 0.5, "news_count": 0,
+                    "hot_topics": "", "recent_direction": 0.0, "method": "fallback",
+                    "events": [], "event_discount": 1.0, "event_labels": [],
+                }
     return factors
 
 
 # ═══════════════════════════════════════
 # 5. 整合到 ML 评分
 # ═══════════════════════════════════════
-def sentiment_boost(ml_score_original, sentiment_factors, weight=0.15):
-    """将情绪因子融合进 ML 评分（含异常事件折扣）
 
-    Args:
-        ml_score_original: ML 模型评分 (0~1)
-        sentiment_factors: 情绪因子 dict
-        weight: 情绪权重 (默认 15%)
+def sentiment_boost_v2(ml_score_original, sentiment_factors,
+                       cross_section_signals=None):
+    """情绪因子融合 v2 — 自适应权重 + 可选横截面去偏（sentiment_boost 代理到此函数）"""
+    cfg = {
+        "min_signal_threshold": 0.03,
+        "strong_signal_threshold": 0.10,
+        "base_weight": 0.15,
+        "weak_signal_weight": 0.05,
+        "strong_signal_weight": 0.30,
+        "event_discount_base": 0.85,
+        "event_min_keep": 0.10,
+        "event_direction_penalty": 0.3,
+    }
+    try:
+        from ml_optimized_picker_v5 import SENTIMENT_V2_CFG
+        cfg.update(SENTIMENT_V2_CFG)
+    except:
+        pass
 
-    Returns:
-        fused_score: 融合后评分 (0~1)
-        adjustment: 调整幅度
-        event_adjustment: 事件折扣调整幅度
-    """
     s = sentiment_factors
+
+    # 无新闻 → 无影响
+    if s.get("news_count", 0) == 0:
+        return ml_score_original, 0.0, 0.0
 
     # 情绪信号强度 (-1 ~ +1)
     sentiment_signal = s.get("sentiment_score", 0) * 0.4
     sentiment_signal += s.get("recent_direction", 0) * 0.3
     sentiment_signal += (s.get("sentiment_urgency", 0) - 0.5) * 0.3
 
-    # 无新闻则中立
-    if s.get("news_count", 0) == 0:
-        sentiment_signal = 0
-
-    # LLM / FinBERT 方法有更高的置信度权重
-    if s.get("method") in ("llm", "finbert") and s.get("news_count", 0) > 0:
+    # LLM/FinBERT 方法有更高置信度
+    if s.get("method") in ("llm", "finbert"):
         sentiment_signal *= 1.3 if s.get("method") == "llm" else 1.2
         sentiment_signal = np.clip(sentiment_signal, -1.0, 1.0)
 
-    # 有重大负面话题则打折
-    topics = s.get("hot_topics", "")
-    has_negative_topic = any(
-        kw in topics.lower()
-        for kw in ["regulatory", "lawsuit", "downgrade"]
-    )
-    if has_negative_topic and sentiment_signal > 0:
-        sentiment_signal *= 0.5
-
-    # 情绪信号从 [-1, 1] 映射到 [0, 1]
+    # 从 [-1, 1] 映射到 [0, 1]
     sentiment_norm = (sentiment_signal + 1) / 2
 
-    # 融合: ML (默认 85%) + 情绪 (15%)
+    # ─── 横截面去偏（解决系统性乐观偏差）───
+    if cross_section_signals is not None and isinstance(cross_section_signals, list):
+        # 对所有股票的情绪信号做z-score标准化
+        valid = [s for s in cross_section_signals if s is not None]
+        if len(valid) > 3:
+            mean_sig = np.mean(valid)
+            std_sig = np.std(valid)
+            if std_sig > 0.01 and abs(mean_sig) > 0.01:  # 只有存在明显偏差时才去偏
+                # 从当前信号中减去均值，再缩放到相同强度水平
+                centered_signal = (sentiment_signal - mean_sig)
+                # 缩放到[-0.3, 0.3]范围（用较大的std分母避免过度放大）
+                denom = max(std_sig, 0.05)
+                centered_signal = np.clip(centered_signal / denom * 0.12, -0.3, 0.3)
+                sentiment_signal = centered_signal
+                sentiment_norm = (sentiment_signal + 1) / 2
+
+    # 信号强度判定 → 自适应权重
+    signal_strength = abs(sentiment_signal)
+    if signal_strength < cfg["min_signal_threshold"]:
+        weight = cfg["weak_signal_weight"]
+    elif signal_strength > cfg["strong_signal_threshold"]:
+        weight = cfg["strong_signal_weight"]
+    else:
+        weight = cfg["base_weight"]
+
+    # 融合
     fused = ml_score_original * (1 - weight) + sentiment_norm * weight
     adjustment = fused - ml_score_original
 
-    # ─── 异常事件折扣 (额外惩罚, 不受weight控制) ───
+    # ─── 异常事件折扣 ───
     event_discount = s.get("event_discount", 1.0)
     events = s.get("events", [])
     if events and event_discount < 1.0:
-        # 事件折扣: 直接乘以融合后评分
         fused_with_event = fused * event_discount
         event_adjustment = fused_with_event - fused
         return np.clip(fused_with_event, 0, 1), adjustment, event_adjustment
 
     return np.clip(fused, 0, 1), adjustment, 0.0
 
+
+def sentiment_boost(ml_score_original, sentiment_factors, weight=0.15):
+    """情绪因子融合 — 兼容 v1 接口，代理到 v2"""
+    return sentiment_boost_v2(ml_score_original, sentiment_factors)
 
 # ═══════════════════════════════════════
 # 6. CLI
