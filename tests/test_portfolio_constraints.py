@@ -18,3 +18,14 @@ def test_oos_calibration_is_monotonic_for_monotonic_data():
         buckets=5,
     )
     assert mapped[1] > mapped[0]
+
+
+def test_non_monotonic_calibration_is_rejected():
+    import pytest
+    with pytest.raises(ValueError, match="not monotonic"):
+        map_scores_to_expected_returns(
+            [0.15, 0.85],
+            [0.1, 0.2, 0.3, 0.4, 0.5],
+            [0.02, -0.01, 0.01, 0.0, -0.02],
+            buckets=5,
+        )

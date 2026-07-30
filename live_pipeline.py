@@ -27,6 +27,7 @@ import numpy as np
 import pandas as pd
 import yfinance as yf
 import warnings
+from quant.backtest.costs import TransactionCostModel
 warnings.filterwarnings("ignore", category=FutureWarning, module="yfinance")
 
 DB_PATH = "live_trading.db"
@@ -272,11 +273,14 @@ class StrategyEngine:
 class PaperBroker:
     """模拟券商"""
 
-    def __init__(self, initial_cash=100000.0):
+    def __init__(self, initial_cash=100000.0, db_path=None, costs=None):
         self.initial_cash = initial_cash
+        self.db_path = db_path or DB_PATH
+        self.costs = costs or TransactionCostModel()
+        self.costs.validate()
 
     def get_cash(self):
-        conn = sqlite3.connect(DB_PATH)
+        conn = sqlite3.connect(self.db_path)
         c = conn.cursor()
         c.execute("SELECT value FROM config WHERE key='cash'")
         row = c.fetchone()
@@ -286,13 +290,13 @@ class PaperBroker:
         return self.initial_cash
 
     def set_cash(self, amount):
-        conn = sqlite3.connect(DB_PATH)
+        conn = sqlite3.connect(self.db_path)
         conn.execute("INSERT OR REPLACE INTO config (key, value) VALUES ('cash', ?)", (str(amount),))
         conn.commit()
         conn.close()
 
     def get_position(self, ticker):
-        conn = sqlite3.connect(DB_PATH)
+        conn = sqlite3.connect(self.db_path)
         c = conn.cursor()
         c.execute("SELECT quantity, avg_cost FROM positions WHERE ticker=?", (ticker,))
         row = c.fetchone()
@@ -355,7 +359,7 @@ class PaperBroker:
         action = action.upper()
         if action not in {"BUY", "SELL"} or price <= 0 or quantity <= 0:
             return {"status": "REJECTED", "reason": "invalid order"}
-        conn = sqlite3.connect(DB_PATH, timeout=10)
+        conn = sqlite3.connect(self.db_path, timeout=10)
         order_id = uuid.uuid4().hex
         now = datetime.datetime.now().isoformat()
         try:
@@ -375,21 +379,23 @@ class PaperBroker:
                 old_qty, old_avg = pos_row if pos_row else (0, 0.0)
                 if action == "BUY":
                     notional = price * quantity
-                    if notional > cash:
+                    fee = self.costs.amount(notional, action)
+                    if notional + fee > cash:
                         return {"status": "REJECTED", "reason": "insufficient cash"}
                     new_qty = old_qty + quantity
-                    new_avg = (old_avg * old_qty + notional) / new_qty
-                    cash -= notional
+                    new_avg = (old_avg * old_qty + notional + fee) / new_qty
+                    cash -= notional + fee
                     pnl = 0.0
                 else:
                     quantity = min(quantity, old_qty)
                     if quantity <= 0:
                         return {"status": "REJECTED", "reason": "insufficient position"}
                     notional = price * quantity
+                    fee = self.costs.amount(notional, action)
                     new_qty = old_qty - quantity
                     new_avg = old_avg if new_qty else 0.0
-                    cash += notional
-                    pnl = notional - old_avg * quantity
+                    cash += notional - fee
+                    pnl = notional - fee - old_avg * quantity
                 conn.execute(
                     "INSERT OR REPLACE INTO config (key, value) VALUES ('cash', ?)",
                     (str(cash),),
@@ -409,6 +415,7 @@ class PaperBroker:
                 "ticker": ticker,
                 "price": price,
                 "quantity": quantity,
+                "fee": fee,
             }
         except sqlite3.Error as exc:
             conn.rollback()

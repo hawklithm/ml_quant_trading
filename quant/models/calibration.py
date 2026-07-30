@@ -50,6 +50,9 @@ def map_scores_to_expected_returns(current_scores, calibration_scores, calibrati
     boundaries[-1] = float("inf")
     history["bucket"] = pd.cut(history["score"], bins=boundaries, labels=False, include_lowest=True)
     means = history.groupby("bucket")["return"].mean()
+    ordered_means = means.sort_index().tolist()
+    if any(left > right for left, right in zip(ordered_means, ordered_means[1:])):
+        raise ValueError("OOS calibration is not monotonic; Kelly input is disabled")
     current = pd.Series(current_scores, dtype=float)
     current_bucket = pd.cut(current, bins=boundaries, labels=False, include_lowest=True)
     mapped = current_bucket.map(means).fillna(history["return"].mean())
