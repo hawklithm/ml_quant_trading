@@ -4,6 +4,7 @@ import pandas as pd
 
 from .costs import TransactionCostModel
 from .metrics import performance_metrics
+from quant.data.validation import validate_price_frame, validate_signal_frame
 
 
 def run_long_only_backtest(
@@ -24,22 +25,11 @@ def run_long_only_backtest(
         raise ValueError("initial_cash, top_n and hold_days must be positive")
     costs = costs or TransactionCostModel()
     costs.validate()
-    required_signals = {"signal_date", "ticker", "score"}
-    required_prices = {"date", "ticker", "close"}
-    if not required_signals.issubset(signals.columns):
-        raise ValueError(f"signals requires {sorted(required_signals)}")
     suspicious = [column for column in signals.columns if str(column).lower().startswith("future_")]
     if suspicious:
         raise ValueError(f"signals contain forbidden future-looking columns: {suspicious}")
-    if not required_prices.issubset(prices.columns):
-        raise ValueError(f"prices requires {sorted(required_prices)}")
-
-    sig = signals.copy()
-    px = prices.copy()
-    sig["signal_date"] = pd.to_datetime(sig["signal_date"]).dt.normalize()
-    px["date"] = pd.to_datetime(px["date"]).dt.normalize()
-    px = px.sort_values(["date", "ticker"])
-    sig = sig.sort_values(["signal_date", "score"], ascending=[True, False])
+    sig = validate_signal_frame(signals)
+    px = validate_price_frame(prices)
     dates = sorted(px["date"].unique())
     cash = float(initial_cash)
     positions = {}
@@ -77,7 +67,8 @@ def run_long_only_backtest(
                     if current_price is None:
                         continue
                     current_quantity = positions.get(ticker, (0.0, current_price))[0]
-                    target_quantity = current_value * target.get(ticker, 0.0) / current_price
+                    buy_cost_rate = costs.rate("BUY")
+                    target_quantity = current_value * target.get(ticker, 0.0) / (current_price * (1.0 + buy_cost_rate))
                     delta = target_quantity - current_quantity
                     if abs(delta) < 1e-10:
                         continue
@@ -136,8 +127,7 @@ def run_point_in_time_backtest(
     return columns signal_date, ticker and score. The history passed to it is
     truncated to date <= as_of; this is the primary anti-lookahead boundary.
     """
-    px = prices.copy()
-    px["date"] = pd.to_datetime(px["date"]).dt.normalize()
+    px = validate_price_frame(prices)
     available_dates = sorted(px["date"].unique())
     requested = available_dates if signal_dates is None else [
         pd.Timestamp(value).normalize() for value in signal_dates
@@ -158,11 +148,7 @@ def run_point_in_time_backtest(
         result = signal_generator(as_of, tickers, history)
         if result is None:
             continue
-        result = pd.DataFrame(result).copy()
-        required = {"signal_date", "ticker", "score"}
-        if not required.issubset(result.columns):
-            raise ValueError(f"signal_generator must return {sorted(required)}")
-        result["signal_date"] = pd.to_datetime(result["signal_date"]).dt.normalize()
+        result = validate_signal_frame(pd.DataFrame(result))
         if (result["signal_date"] > as_of).any():
             raise ValueError("signal_generator returned a signal dated after as_of")
         generated.append(result)

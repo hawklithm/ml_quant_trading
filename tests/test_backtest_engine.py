@@ -24,6 +24,7 @@ def test_backtest_uses_next_session_and_records_costs():
     assert result["trades"].iloc[0]["execution_date"] == dates[1]
     assert result["trades"].iloc[0]["cost"] > 0
     assert result["metrics"]["observations"] == len(dates)
+    assert (result["equity"]["cash"] >= 0).all()
 
 
 def test_backtest_rejects_future_signal_columns():

@@ -1,8 +1,10 @@
 """Run a reproducible point-in-time historical report from CSV or yfinance."""
 
 import argparse
+import hashlib
 import json
 import sys
+from datetime import datetime, timezone
 from pathlib import Path
 
 import pandas as pd
@@ -71,21 +73,30 @@ def main():
     prices = load_prices(args)
     dates = prices.loc[(prices.date >= pd.Timestamp(args.start)) & (prices.date < pd.Timestamp(args.end)), "date"].drop_duplicates().sort_values()
     dates = dates.iloc[::args.signal_step]
+    costs = TransactionCostModel(commission_bps=3.0, slippage_bps=5.0, sell_tax_bps=10.0)
     result = run_point_in_time_backtest(
         prices, make_v5_signal_generator(args.market), universe_root=args.universe_root,
         market=args.market, signal_dates=dates, top_n=args.top_n, hold_days=args.hold_days,
-        costs=TransactionCostModel(commission_rate=0.0003, slippage_rate=0.0005, sell_tax_rate=0.001),
+        costs=costs,
     )
     output = Path(args.output)
     output.parent.mkdir(parents=True, exist_ok=True)
     result["equity"].to_csv(output.with_suffix(".equity.csv"))
     result["trades"].to_csv(output.with_suffix(".trades.csv"), index=False)
-    suite = run_benchmark_suite(prices, result, market=args.market, costs=TransactionCostModel(commission_rate=0.0003, slippage_rate=0.0005, sell_tax_rate=0.001), top_n=args.top_n, hold_days=args.hold_days)
+    suite = run_benchmark_suite(prices, result, market=args.market, costs=costs, top_n=args.top_n, hold_days=args.hold_days)
     for name, benchmark in suite["results"].items():
         if name != "strategy":
             benchmark["equity"].to_csv(output.with_name(f"{output.name}.{name}.equity.csv"))
             benchmark["trades"].to_csv(output.with_name(f"{output.name}.{name}.trades.csv"), index=False)
-    summary = {"start": args.start, "end": args.end, "market": args.market, "rows": len(prices), "metrics": result["metrics"], "benchmarks": suite["comparison"], "cost_model": result["cost_model"]}
+    config_path = Path("v5_config.json")
+    config_hash = hashlib.sha256(config_path.read_bytes()).hexdigest() if config_path.exists() else None
+    summary = {
+        "generated_at_utc": datetime.now(timezone.utc).isoformat(),
+        "start": args.start, "end": args.end, "market": args.market,
+        "rows": len(prices), "signal_dates": len(dates),
+        "config_sha256": config_hash, "metrics": result["metrics"],
+        "benchmarks": suite["comparison"], "cost_model": result["cost_model"],
+    }
     output.with_suffix(".json").write_text(json.dumps(summary, ensure_ascii=False, indent=2, default=str), encoding="utf-8")
     print(json.dumps(summary, ensure_ascii=False, indent=2, default=str))
 

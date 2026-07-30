@@ -390,3 +390,10 @@
 - 已验证：`pytest -q`、`python -m compileall -q .`、`python -m json.tool v5_config.json`。真实 Yahoo 下载尝试因服务限流未生成报告；应使用 CSV 输入重跑，不能把限流结果视为有效回测结果。
 - 本轮继续完成：历史报告增加等权、固定随机、SPY/HSI 买入持有基准；新增 `scripts/reconcile_paper.py` 接通 PaperBroker SQLite；核心维护链路的裸 `except:` 已替换为限定异常并输出原因；删除 5 个仓库内无引用的调试/临时入口。
 - 当前唯一外部依赖项：需要稳定行情源或用户提供历史 CSV 后，运行报告命令并保存真实数据结果，不能用合成数据替代生产结论。
+
+### 第二轮质量增强
+
+- 回测入口新增行情和信号 fail-fast 校验：拒绝重复 date/ticker、非有限价格/分数、空标的和非正收盘价。
+- 修复报告命令交易成本参数名错误，统一使用 commission/slippage/sell tax bps；回测目标仓位预留买入成本，现金不应因手续费变为负数。
+- 历史报告增加 UTC 生成时间、配置 SHA-256、信号日期数量和成本模型，增强结果可追溯性。
+- 新增校验测试，并更新 README 的维护入口、历史报告和 PaperBroker 对账命令。

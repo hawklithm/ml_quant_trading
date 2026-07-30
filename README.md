@@ -97,3 +97,23 @@ python live_pipeline.py --report                     # 查看交易记录
 - 回测≠实盘, 样本外验证必不可少
 - A股推荐用 AkShare 替代 yfinance
 - 实时管道是模拟的, 不要用于实盘
+
+## 当前维护链路
+
+新功能统一接入 v5 和 `quant/` 包，旧版选股脚本只用于历史兼容，不再添加功能。
+
+```bash
+# 离线 point-in-time 历史回测，输出策略、SPY/HSI、等权和随机基准
+python scripts/run_historical_report.py --prices prices.csv \
+  --start 2023-01-01 --end 2025-01-01 --market US \
+  --output artifacts/historical_report
+
+# 将 PaperBroker SQLite 与回测成交/净值对账
+python scripts/reconcile_paper.py --db live_trading.db \
+  --backtest-equity artifacts/historical_report.equity.csv \
+  --backtest-trades artifacts/historical_report.trades.csv \
+  --prices prices.csv --output artifacts/paper_reconciliation.json
+```
+
+报告包含生成时间、配置 SHA-256、成本模型、样本量和基准指标。Yahoo/AkShare
+等外部数据源不可用时，必须使用已落盘的历史 CSV；禁止用当前数据替代历史数据。
