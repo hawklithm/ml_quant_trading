@@ -371,7 +371,7 @@
 - T2.1 基础设施：新增 quant/data/universe.py，支持按交易日保存和还原历史股票池；cron 盘前任务会归档当前 watchlist 快照。
 - T2.3 基础设施：新增 Rank IC、分位数 Top-bottom spread、换手率和扩展绩效指标。
 - T2.4 基础设施：新增新闻归档与 signal-time 过滤模块，未来接入新闻 provider 时必须先经过该过滤层。
-- T2.5 基础设施：新增 OOS 分数分桶和单调性校准模块，尚未接入 Kelly 权重计算。
+- T2.5 基础设施：新增 OOS 分数分桶和单调性校准模块；cross_validate_picker.py 通过 `--calibration-csv` 显式接入校准数据，缺少校准数据时强制使用 risk parity，不直接把 ML 分数映射成收益。
 - T2.1/T2.2 接入：新增 run_point_in_time_backtest() 和 v5 replay signal generator；模型回调只能接收 as_of 之前的历史价格和当日股票池。
 - T2.5 接入：portfolio_optimizer.py 支持 OOS 分数校准输入、单票权重上限和默认禁空约束。
 - T2.4 接入：finbert_sentiment.py 在传入 signal_time 时先归档新闻，再过滤未来发布时间；异常时间戳保留实时过滤 fallback。
@@ -379,7 +379,7 @@
 - T3.4/T3.5：新增 GitHub Actions 基础 CI 和 cron --dry-run；自动配置修改仍需显式 --apply-config。
 - T3.5 安全默认值：cron 默认只记录自动调参建议，必须显式传入 --apply-config 才能修改配置。
 
-仍需后续处理的工程债务：逐步合并 v1/v2/v4/v5 重复脚本、在稳定数据源可用时补充真实历史数据重放报告。真实券商接入仍明确禁止。
+仍需后续处理的外部事项：在稳定数据源可用时补充真实历史数据重放报告。真实券商接入仍明确禁止。
 
 ### 本轮收口记录
 
@@ -397,3 +397,6 @@
 - 修复报告命令交易成本参数名错误，统一使用 commission/slippage/sell tax bps；回测目标仓位预留买入成本，现金不应因手续费变为负数。
 - 历史报告增加 UTC 生成时间、配置 SHA-256、信号日期数量和成本模型，增强结果可追溯性。
 - 新增校验测试，并更新 README 的维护入口、历史报告和 PaperBroker 对账命令。
+- point-in-time 回测现在强制 signal generator 返回 `signal_date == as_of`，并拒绝不属于当日股票池的 ticker，避免回调内部产生隐性前视偏差。
+- 已删除旧 v1/v4 picker、旧 news sentiment、旧 ml_deep_scan 和 debug 运行入口，迁移说明保留在 `legacy/README.md`；维护入口统一到 v5、FinBERT、quant 和 cron。
+- `cross_validate_picker.py` 已改为 argparse，支持 `--calibration-csv`；配置读取统一使用 UTF-8，并通过 `--help` 验证。

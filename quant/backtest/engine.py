@@ -149,8 +149,11 @@ def run_point_in_time_backtest(
         if result is None:
             continue
         result = validate_signal_frame(pd.DataFrame(result))
-        if (result["signal_date"] > as_of).any():
-            raise ValueError("signal_generator returned a signal dated after as_of")
+        if (result["signal_date"] != as_of).any():
+            raise ValueError("signal_generator must return signals dated exactly as_of")
+        unknown = sorted(set(result["ticker"]) - set(tickers))
+        if unknown:
+            raise ValueError(f"signal_generator returned tickers outside the as-of universe: {unknown}")
         generated.append(result)
     if not generated:
         raise ValueError("signal_generator produced no point-in-time signals")

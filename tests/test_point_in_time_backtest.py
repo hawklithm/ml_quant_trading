@@ -36,3 +36,24 @@ def test_point_in_time_generator_receives_no_future_prices(tmp_path):
     )
     assert len(seen) == 3
     assert result["signals"]["signal_date"].max() <= dates[2]
+
+
+def test_point_in_time_rejects_backdated_and_unknown_signals():
+    dates = pd.date_range("2024-01-01", periods=4, freq="B")
+    prices = pd.DataFrame([
+        {"date": date, "ticker": "AAA", "close": 100.0 + i}
+        for i, date in enumerate(dates)
+    ])
+
+    def backdated(as_of, tickers, history):
+        return pd.DataFrame([{"signal_date": as_of - pd.Timedelta(days=1), "ticker": "AAA", "score": 1.0}])
+
+    import pytest
+    with pytest.raises(ValueError, match="exactly as_of"):
+        run_point_in_time_backtest(prices, backdated, signal_dates=[dates[1]], top_n=1)
+
+    def unknown(as_of, tickers, history):
+        return pd.DataFrame([{"signal_date": as_of, "ticker": "FUTURE", "score": 1.0}])
+
+    with pytest.raises(ValueError, match="outside"):
+        run_point_in_time_backtest(prices, unknown, signal_dates=[dates[1]], top_n=1)

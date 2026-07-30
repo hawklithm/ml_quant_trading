@@ -31,18 +31,19 @@ v5 改进:
   python cross_validate_picker.py --risk-control      # 启用风控建议
 """
 
+import argparse
 import numpy as np
 import pandas as pd
 import warnings, sys, os, json
 from datetime import datetime, timedelta
 
-warnings.filterwarnings("ignore")
+warnings.filterwarnings("ignore", category=FutureWarning)
 
 # ═══════════════════════════════════════
 # 从 v5_config.json 加载参数
 # ═══════════════════════════════════════
 _CONFIG_PATH = os.path.join(os.path.dirname(__file__), "v5_config.json")
-with open(_CONFIG_PATH) as f:
+with open(_CONFIG_PATH, encoding="utf-8") as f:
     _CONFIG = json.load(f)
 
 _ML = _CONFIG.get("ml_scoring", {})
@@ -662,21 +663,36 @@ def save_composite_report(results, filename="cross_validate"):
 # CLI 入口
 # ═══════════════════════════════════════
 if __name__ == "__main__":
-    args = sys.argv[1:]
+    parser = argparse.ArgumentParser(description="v5 multi-factor cross-validation picker")
+    parser.add_argument("--quick", action="store_true", help="use the quick ML model path")
+    parser.add_argument("--no-sentiment", action="store_true")
+    parser.add_argument("--hk", action="store_true", help="include the HK universe")
+    parser.add_argument("--backtest", action="store_true")
+    parser.add_argument("--optimize", action="store_true")
+    parser.add_argument("--risk-control", action="store_true")
+    parser.add_argument("--no-market", action="store_true")
+    parser.add_argument("--alpha", action="store_true")
+    parser.add_argument("--top", type=int, default=30)
+    parser.add_argument("--calibration-csv", help="OOS CSV with score and realized_return columns for Kelly")
+    cli = parser.parse_args()
 
-    quick = "--quick" in args
-    no_sentiment = "--no-sentiment" in args
-    include_hk = "--hk" in args
-    do_optimize = "--optimize" in args
-    do_backtest = "--backtest" in args
-    do_risk = "--risk-control" in args
-    do_market_state = "--no-market" not in args
-    do_alpha = "--alpha" in args or do_optimize
-    top_n = 30
-    if "--top" in args:
-        idx = args.index("--top")
-        if idx + 1 < len(args):
-            top_n = int(args[idx + 1])
+    quick = cli.quick
+    no_sentiment = cli.no_sentiment
+    include_hk = cli.hk
+    do_optimize = cli.optimize
+    do_backtest = cli.backtest
+    do_risk = cli.risk_control
+    do_market_state = not cli.no_market
+    do_alpha = cli.alpha or do_optimize
+    top_n = cli.top
+    calibration_scores = calibration_returns = None
+    if cli.calibration_csv:
+        calibration = pd.read_csv(cli.calibration_csv)
+        required_calibration = {"score", "realized_return"}
+        if not required_calibration.issubset(calibration.columns):
+            parser.error("--calibration-csv requires score and realized_return columns")
+        calibration_scores = calibration["score"].to_numpy()
+        calibration_returns = calibration["realized_return"].to_numpy()
 
     tickers = list(US_WATCHLIST)
     if include_hk:
@@ -744,7 +760,11 @@ if __name__ == "__main__":
 
     # 10. 组合优化 (P2.3)
     if do_optimize:
-        run_portfolio_optimization(results, top_n=min(15, top_n))
+        run_portfolio_optimization(
+            results, top_n=min(15, top_n),
+            calibration_scores=calibration_scores,
+            calibration_returns=calibration_returns,
+        )
 
     print(f"\n  ✅ 交叉验证选股完成! (总耗时: {(datetime.now() - start).total_seconds():.0f}s)")
     print(f"  💡 选项: --quick | --no-sentiment | --hk | --backtest | --alpha | --optimize | --risk-control")
