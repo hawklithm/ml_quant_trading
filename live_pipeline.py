@@ -22,11 +22,12 @@ import json
 import sqlite3
 import time
 import datetime
+import uuid
 import numpy as np
 import pandas as pd
 import yfinance as yf
 import warnings
-warnings.filterwarnings("ignore")
+warnings.filterwarnings("ignore", category=FutureWarning, module="yfinance")
 
 DB_PATH = "live_trading.db"
 
@@ -62,7 +63,11 @@ def init_db():
             quantity INTEGER,
             timestamp TEXT,
             strategy TEXT,
-            pnl REAL DEFAULT 0
+            pnl REAL DEFAULT 0,
+            order_id TEXT,
+            signal_id TEXT,
+            model_version TEXT,
+            order_status TEXT DEFAULT 'FILLED'
         )
     """)
 
@@ -84,6 +89,16 @@ def init_db():
         )
     """)
 
+    for column, definition in {
+        "order_id": "TEXT",
+        "signal_id": "TEXT",
+        "model_version": "TEXT",
+        "order_status": "TEXT DEFAULT 'FILLED'",
+    }.items():
+        try:
+            c.execute(f"ALTER TABLE trades ADD COLUMN {column} {definition}")
+        except sqlite3.OperationalError:
+            pass
     conn.commit()
     conn.close()
 
@@ -125,7 +140,8 @@ def fetch_prices(tickers):
                     "volume": vol_val,
                     "timestamp": datetime.datetime.now().isoformat()
                 }
-            except:
+            except (KeyError, TypeError, ValueError, IndexError) as exc:
+                print(f"  price row skipped for {t}: {exc}")
                 continue
 
         return result
@@ -154,7 +170,8 @@ def backfill_history(tickers, years=2):
                 """, (ticker, ts, float(row["Open"]), float(row["High"]),
                       float(row["Low"]), float(row["Close"]), int(row["Volume"])))
                 count += 1
-            except:
+            except (sqlite3.Error, KeyError, TypeError, ValueError) as exc:
+                print(f"  backfill row skipped for {ticker}: {exc}")
                 continue
 
     conn.commit()
@@ -284,7 +301,7 @@ class PaperBroker:
             return {"quantity": row[0], "avg_cost": row[1]}
         return {"quantity": 0, "avg_cost": 0}
 
-    def execute(self, ticker, action, price, quantity=100):
+    def _execute_legacy(self, ticker, action, price, quantity=100):
         """执行交易"""
         conn = sqlite3.connect(DB_PATH)
         now = datetime.datetime.now().isoformat()
@@ -332,6 +349,72 @@ class PaperBroker:
         conn.commit()
         conn.close()
         return {"status": "EXECUTED", "action": action, "ticker": ticker, "price": price, "quantity": quantity}
+
+    def execute(self, ticker, action, price, quantity=100, signal_id=None, model_version=None):
+        """Execute one idempotent paper order in a single SQLite transaction."""
+        action = action.upper()
+        if action not in {"BUY", "SELL"} or price <= 0 or quantity <= 0:
+            return {"status": "REJECTED", "reason": "invalid order"}
+        conn = sqlite3.connect(DB_PATH, timeout=10)
+        order_id = uuid.uuid4().hex
+        now = datetime.datetime.now().isoformat()
+        try:
+            with conn:
+                if signal_id:
+                    existing = conn.execute(
+                        "SELECT order_id, order_status FROM trades WHERE signal_id=? AND ticker=? AND side=?",
+                        (signal_id, ticker, action),
+                    ).fetchone()
+                    if existing:
+                        return {"status": "DUPLICATE", "order_id": existing[0], "ticker": ticker}
+                cash_row = conn.execute("SELECT value FROM config WHERE key='cash'").fetchone()
+                cash = float(cash_row[0]) if cash_row else self.initial_cash
+                pos_row = conn.execute(
+                    "SELECT quantity, avg_cost FROM positions WHERE ticker=?", (ticker,)
+                ).fetchone()
+                old_qty, old_avg = pos_row if pos_row else (0, 0.0)
+                if action == "BUY":
+                    notional = price * quantity
+                    if notional > cash:
+                        return {"status": "REJECTED", "reason": "insufficient cash"}
+                    new_qty = old_qty + quantity
+                    new_avg = (old_avg * old_qty + notional) / new_qty
+                    cash -= notional
+                    pnl = 0.0
+                else:
+                    quantity = min(quantity, old_qty)
+                    if quantity <= 0:
+                        return {"status": "REJECTED", "reason": "insufficient position"}
+                    notional = price * quantity
+                    new_qty = old_qty - quantity
+                    new_avg = old_avg if new_qty else 0.0
+                    cash += notional
+                    pnl = notional - old_avg * quantity
+                conn.execute(
+                    "INSERT OR REPLACE INTO config (key, value) VALUES ('cash', ?)",
+                    (str(cash),),
+                )
+                conn.execute(
+                    "INSERT OR REPLACE INTO positions (ticker, quantity, avg_cost, last_updated) VALUES (?, ?, ?, ?)",
+                    (ticker, new_qty, new_avg, now),
+                )
+                conn.execute(
+                    "INSERT INTO trades (ticker, side, price, quantity, timestamp, strategy, pnl, order_id, signal_id, model_version, order_status) VALUES (?, ?, ?, ?, ?, 'live', ?, ?, ?, ?, 'FILLED')",
+                    (ticker, action, price, quantity, now, pnl, order_id, signal_id, model_version),
+                )
+            return {
+                "status": "FILLED",
+                "order_id": order_id,
+                "action": action,
+                "ticker": ticker,
+                "price": price,
+                "quantity": quantity,
+            }
+        except sqlite3.Error as exc:
+            conn.rollback()
+            return {"status": "REJECTED", "reason": f"database error: {exc}"}
+        finally:
+            conn.close()
 
 
 # ══════════��════════════════════════════════════
@@ -414,10 +497,18 @@ def run_pipeline(tickers, strategy="sma", interval_minutes=5):
                 if signal["action"] == "BUY" and pos["quantity"] == 0:
                     qty = int(broker.get_cash() * 0.5 / price / 100) * 100  # 50%仓位
                     if qty > 0:
-                        result = broker.execute(ticker, "BUY", price, qty)
+                        result = broker.execute(
+                            ticker, "BUY", price, qty,
+                            signal_id=f"{now.isoformat()}:{ticker}:BUY",
+                            model_version=f"paper-{strategy}",
+                        )
                         print(f"    执行: {result}")
                 elif signal["action"] == "SELL" and pos["quantity"] > 0:
-                    result = broker.execute(ticker, "SELL", price, pos["quantity"])
+                    result = broker.execute(
+                        ticker, "SELL", price, pos["quantity"],
+                        signal_id=f"{now.isoformat()}:{ticker}:SELL",
+                        model_version=f"paper-{strategy}",
+                    )
                     print(f"    执行: {result}")
 
             # 投资组合估值

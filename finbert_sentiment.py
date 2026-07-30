@@ -800,12 +800,57 @@ def deep_sentiment(ticker, news_list):
 # ═══════════════════════════════════════
 # 4. 生成情绪因子
 # ═══════════════════════════════════════
-def build_sentiment_factors(tickers, max_workers=5):
+def build_sentiment_factors(tickers, max_workers=5, signal_time=None, archive_root=None):
     """生成情绪因子字典 {ticker: {factor1: val, ...}}
     
     使用 ThreadPoolExecutor 并行对多只股票做情绪分析（默认5路并发）。
     """
     news_data = fetch_batch_news(tickers)
+    if signal_time is not None:
+        from quant.data.news_archive import append_news_archive, news_as_of
+
+        archive_root = archive_root or os.path.join(CACHE_DIR, "backtest")
+        archive_records = []
+        for ticker, items in news_data.items():
+            for item in items:
+                archive_records.append({
+                    "news_id": item.get("link") or f"{ticker}:{item.get('title', '')}:{item.get('date', '')}",
+                    "ticker": ticker,
+                    "published_at": item.get("date"),
+                    "fetched_at": datetime.now().isoformat(),
+                    "source": "rss",
+                    "title": item.get("title", ""),
+                    "url": item.get("link", ""),
+                    "body": item.get("summary", ""),
+                })
+        archive_ok = True
+        if archive_records:
+            try:
+                append_news_archive(archive_records, archive_root)
+            except ValueError:
+                # A malformed provider timestamp is not allowed into a
+                # point-in-time archive; the live fallback remains available.
+                archive_ok = False
+        visible = news_as_of(archive_root, tickers, signal_time) if archive_ok else pd.DataFrame()
+        filtered = {ticker: [] for ticker in tickers}
+        if archive_ok:
+            for _, row in visible.iterrows():
+                filtered.setdefault(row["ticker"], []).append({
+                    "title": row["title"],
+                    "summary": row.get("body", ""),
+                    "date": pd.Timestamp(row["published_at"]).isoformat(),
+                    "link": row.get("url", ""),
+                })
+        else:
+            cutoff = pd.Timestamp(signal_time)
+            if cutoff.tzinfo is None:
+                cutoff = cutoff.tz_localize("UTC")
+            for ticker, items in news_data.items():
+                for item in items:
+                    published = pd.to_datetime(item.get("date"), utc=True, errors="coerce")
+                    if pd.notna(published) and published <= cutoff:
+                        filtered[ticker].append(item)
+        news_data = filtered
 
     def _analyze_one(ticker):
         news = news_data.get(ticker, [])
@@ -863,8 +908,8 @@ def sentiment_boost_v2(ml_score_original, sentiment_factors,
     try:
         from ml_optimized_picker_v5 import SENTIMENT_V2_CFG
         cfg.update(SENTIMENT_V2_CFG)
-    except:
-        pass
+    except (ImportError, KeyError, TypeError, ValueError) as exc:
+        print(f"  sentiment config unavailable: {exc}")
 
     s = sentiment_factors
 

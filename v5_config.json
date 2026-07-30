@@ -2,10 +2,16 @@
   "_version": "v5.2",
   "_description": "量化选股系统可调优参数 — 修改此文件后无需改动 .py 源码",
   "ml_scoring": {
+    "prediction_horizons": [5, 21],
+    "purge_gap_days": 21,
+    "benchmark_by_market": {
+      "US": "spy",
+      "HK": "hsi"
+    },
     "top_n": 20,
     "min_trading_days": 200,
     "test_splits": 3,
-    "forecast_horizon_short": 21,
+    "forecast_horizon_short": 5,
     "forecast_horizon_long": 21,
     "forecast_horizon_mom": 63,
     "warmup": 30,

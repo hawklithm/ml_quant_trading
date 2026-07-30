@@ -1,13 +1,16 @@
-import yfinance as yf, warnings
-warnings.filterwarnings('ignore')
+import warnings
 
-# Test AAPL
-tk = yf.Ticker('AAPL')
-df = tk.history(period='3mo')
-if df.empty:
-    print('Empty dataframe')
-else:
-    print(f'Rows: {len(df)}, Cols: {list(df.columns)}')
-    print(f'Index: {df.index[0]} ... {df.index[-1]}')
-    tz = getattr(df.index, 'tz', None)
-    print(f'Index tz: {tz}')
+import pytest
+
+
+def test_yfinance_smoke():
+    """Optional live-data smoke test; never block offline unit tests."""
+    yf = pytest.importorskip("yfinance")
+    warnings.filterwarnings("ignore")
+    try:
+        df = yf.Ticker("AAPL").history(period="3mo")
+    except Exception as exc:
+        pytest.skip(f"live Yahoo Finance unavailable: {exc}")
+    if df.empty:
+        pytest.skip("Yahoo Finance returned no data")
+    assert "Close" in df.columns

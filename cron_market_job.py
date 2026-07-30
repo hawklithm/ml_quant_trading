@@ -47,6 +47,8 @@ MARKET_CONFIG = {
 
 V5_CODE_PATH = os.path.join(os.path.dirname(__file__), "ml_optimized_picker_v5.py")
 CONFIG_PATH = os.path.join(os.path.dirname(__file__), "v5_config.json")
+APPLY_CONFIG_CHANGES = False
+DRY_RUN = False
 
 # ─── 配置调节预设 ───
 # review系统自动调优时, 根据accuracy调节confidence_weight的策略
@@ -118,6 +120,9 @@ def load_state(market):
 
 
 def save_state(market, state):
+    if DRY_RUN:
+        print("  dry-run: state unchanged")
+        return
     f = MARKET_CONFIG[market]["state_file"]
     with open(f, "w") as fh:
         json.dump(state, fh, indent=2, default=str)
@@ -184,6 +189,14 @@ def run_pre_market(market, sentiment=False):
         return
 
     tickers = v5["US_WATCHLIST"] if market == "US" else v5["HK_WATCHLIST"]
+    try:
+        from quant.data.universe import build_universe_snapshot, save_universe_snapshot
+        save_universe_snapshot(
+            build_universe_snapshot(tickers, market, today, reason="v5_watchlist"),
+            os.path.join(CACHE_DIR, "backtest"),
+        )
+    except Exception as exc:
+        print(f"  warning: universe snapshot not saved: {exc}")
     print(f"  股票池: {len(tickers)} 只")
 
     # 运行v5评分
@@ -205,6 +218,13 @@ def run_pre_market(market, sentiment=False):
     for r in results:
         pred = {
             "ticker": r["ticker"],
+            "market": market,
+            "signal_date": r.get("signal_date", today),
+            "data_asof": r.get("data_asof", ""),
+            "benchmark": r.get("benchmark", ""),
+            "benchmark_status": r.get("benchmark_status", ""),
+            "cache_age_hours": r.get("cache_age_hours"),
+            "data_stale": r.get("data_stale"),
             "name": NAMES_HK.get(r["ticker"], r["ticker"]),
             "score": r["score"],
             "direction": r["direction"],
@@ -216,6 +236,10 @@ def run_pre_market(market, sentiment=False):
             "mom_3m": r["mom_3m"],
             "walk_forward_r2": r["walk_forward_r2"],
             "direction_source": r.get("direction_source", "unknown"),
+            "target_horizon_days": r.get("target_horizon_days", 5),
+            "direction_horizon_days": r.get("direction_horizon_days", 21),
+            "trailing_return_5d": r.get("trailing_return_5d", ""),
+            "trailing_return_21d": r.get("trailing_return_21d", ""),
         }
         predictions.append(pred)
         predictions_full.append(r)
@@ -249,7 +273,11 @@ def run_pre_market(market, sentiment=False):
             from finbert_sentiment import build_sentiment_factors, sentiment_boost
 
             all_tickers = [p["ticker"] for p in predictions]
-            sentiment_factors = build_sentiment_factors(all_tickers)
+            sentiment_factors = build_sentiment_factors(
+                all_tickers,
+                signal_time=datetime.now(),
+                archive_root=os.path.join(CACHE_DIR, "backtest"),
+            )
 
             event_stocks = []
             for p in predictions:
@@ -375,7 +403,8 @@ def run_post_market(market, sentiment=False):
                     alpha_5d = chg_5d - spy_5d
                 else:
                     alpha_5d = 0
-            except:
+            except (KeyError, TypeError, ValueError) as exc:
+                print(f"  config proposal skipped: {exc}")
                 alpha_5d = 0
 
             # 判断方向是否正确（基于5日涨跌幅）—— 阈值±1.5%避免过窄判定
@@ -694,8 +723,11 @@ def run_post_market(market, sentiment=False):
                 p["consecutive_high_conf_failures"] = max(0, p.get("consecutive_high_conf_failures", 0) - 1)
         pdata["updated"] = today
         os.makedirs(os.path.dirname(penalty_path), exist_ok=True)
-        with open(penalty_path, "w") as f:
-            json.dump(pdata, f, indent=2)
+        if not DRY_RUN:
+            with open(penalty_path, "w") as f:
+                json.dump(pdata, f, indent=2)
+        else:
+            print("  dry-run: stock penalties unchanged")
     except Exception:
         pass
 
@@ -715,7 +747,11 @@ def run_post_market(market, sentiment=False):
             import numpy as np
 
             all_tickers = [p["ticker"] for p in predictions]
-            sentiment_factors = build_sentiment_factors(all_tickers)
+            sentiment_factors = build_sentiment_factors(
+                all_tickers,
+                signal_time=datetime.now(),
+                archive_root=os.path.join(CACHE_DIR, "backtest"),
+            )
 
             # ─── 预计算所有情绪信号用于横截面去偏 ───
             cross_section_raw = []
@@ -862,6 +898,9 @@ def _apply_v5_change(change, state=None, today=None):
        "new": 0.12}                       # 直接设定新值
       {"keys": [...], "new": "auto_reduce"}  # 按预设阶梯调优
     """
+    if not APPLY_CONFIG_CHANGES:
+        print("  dry-run: config suggestion recorded; v5_config.json unchanged")
+        return
     if not isinstance(change, dict) or "keys" not in change:
         print(f"  跳过非结构化变更: {change}")
         return
@@ -936,7 +975,11 @@ if __name__ == "__main__":
     parser.add_argument("--market", required=True, choices=["HK", "US"])
     parser.add_argument("--mode", required=True, choices=["pre", "post"])
     parser.add_argument("--sentiment", action="store_true", help="融合新闻情绪因子和异常事件检测")
+    parser.add_argument("--apply-config", action="store_true", help="apply automatic config changes")
+    parser.add_argument("--dry-run", action="store_true", help="do not persist state, penalties or config")
     args = parser.parse_args()
+    APPLY_CONFIG_CHANGES = args.apply_config
+    DRY_RUN = args.dry_run
 
     if args.mode == "pre":
         run_pre_market(args.market, sentiment=args.sentiment)

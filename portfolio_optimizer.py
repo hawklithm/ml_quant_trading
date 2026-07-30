@@ -17,7 +17,7 @@ import warnings, sys, os
 from datetime import datetime
 from scipy.optimize import minimize, Bounds, LinearConstraint
 
-warnings.filterwarnings("ignore")
+warnings.filterwarnings("ignore", category=FutureWarning)
 
 CACHE_DIR = os.path.expanduser("~/.cache/hermes-quant")
 os.makedirs(CACHE_DIR, exist_ok=True)
@@ -179,11 +179,40 @@ def equal_weight_portfolio(tickers):
     }
 
 
+def cap_and_normalize_weights(weights, max_single_weight=1.0, allow_short=False):
+    """Apply explicit position caps and normalize long-only weights."""
+    values = np.asarray(weights, dtype=float)
+    if values.ndim != 1 or not np.isfinite(values).all():
+        raise ValueError("weights must be a finite one-dimensional array")
+    if max_single_weight <= 0:
+        raise ValueError("max_single_weight must be positive")
+    if not allow_short:
+        values = np.maximum(values, 0.0)
+    if np.sum(np.abs(values)) <= 1e-12:
+        values = np.ones(len(values), dtype=float)
+    if not allow_short:
+        cap = max(float(max_single_weight), 1.0 / len(values))
+        values = np.minimum(values, cap)
+        for _ in range(len(values) + 2):
+            remainder = 1.0 - values.sum()
+            if remainder <= 1e-10:
+                break
+            room = np.maximum(cap - values, 0.0)
+            if room.sum() <= 1e-12:
+                break
+            values += remainder * room / room.sum()
+        return values / values.sum()
+    gross = np.sum(np.abs(values))
+    return values / gross
+
+
 # ═══════════════════════════════════════
 # 5. 主优化函数
 # ═══════════════════════════════════════
 def optimize_portfolio(selected_stocks, ml_scores_dict=None, historical_returns_df=None,
-                       period="1y", mode="kelly", risk_free_rate=0.05, max_leverage=1.0):
+                       period="1y", mode="kelly", risk_free_rate=0.05, max_leverage=1.0,
+                       calibration_scores=None, calibration_returns=None,
+                       max_single_weight=0.25, allow_short=False):
     """
     完整组合优化流程。
 
@@ -248,7 +277,13 @@ def optimize_portfolio(selected_stocks, ml_scores_dict=None, historical_returns_
                 "weights": {t: 1.0 for t in valid_tickers}, "note": "仅一只股票有效"}
 
     # ── 预期收益 ──
-    if ml_scores_dict:
+    if ml_scores_dict and calibration_scores is not None and calibration_returns is not None:
+        from quant.models.calibration import map_scores_to_expected_returns
+        current_scores = np.array([ml_scores_dict.get(t, 0.5) for t in valid_tickers])
+        expected_returns = map_scores_to_expected_returns(
+            current_scores, calibration_scores, calibration_returns
+        )
+    elif ml_scores_dict:
         # 用 ML 评分做先验: 高评分 = 高预期收益
         scores = np.array([ml_scores_dict.get(t, 0.5) for t in valid_tickers])
         # 将 0~1 评分映射到 -5%~+20% 年化
@@ -262,12 +297,16 @@ def optimize_portfolio(selected_stocks, ml_scores_dict=None, historical_returns_
 
     # ── 优化 ──
     if mode == "kelly":
-        weights = kelly_optimal_weights(expected_returns, cov_matrix,
-                                         risk_free_rate, max_leverage)
+        weights = kelly_optimal_weights(
+            expected_returns, cov_matrix, risk_free_rate, max_leverage,
+            no_short=not allow_short,
+        )
     elif mode == "risk_parity":
         weights = risk_parity_portfolio(cov_matrix)
     else:  # equal_weight
         weights = np.ones(n) / n
+
+    weights = cap_and_normalize_weights(weights, max_single_weight, allow_short)
 
     # ── 结果汇总 ──
     port_ret = np.dot(weights, expected_returns)
@@ -296,6 +335,8 @@ def optimize_portfolio(selected_stocks, ml_scores_dict=None, historical_returns_
         "volatility": round(float(port_vol), 4),
         "sharpe_ratio": round(float(sharpe), 4),
         "max_leverage": max_leverage,
+        "max_single_weight": max_single_weight,
+        "allow_short": allow_short,
         "n_assets": n,
         "timestamp": datetime.now().isoformat(),
     }

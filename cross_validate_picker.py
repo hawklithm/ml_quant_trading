@@ -5,7 +5,7 @@
 融合:
   1. ML 优化选股 (ml_optimized_picker_v5.py v5.2) — 50+ 特征 + 多模型 ensemble + 自适应窗口 + 时间衰减
   2. 多因子选股 (stock_picker_v2.py) — 固定因子权重 + 因子分析
-  3. 新闻情绪 (news_sentiment_v2.py) — 新闻情绪因子 (美+港)
+  3. 新闻情绪 (finbert_sentiment.py) — 新闻情绪因子 (美+港)
   4. 市场状态 (market_state.py) — 自适应因子权重 (P2.1)
   5. Alpha 工厂 (alpha_factory.py) — 经典 Alpha 因子 (P2.2)
   6. 组合优化 (portfolio_optimizer.py) — Kelly/Ledoit-Wolf 组合构建 (P2.3)
@@ -105,17 +105,17 @@ def run_ml_scoring(tickers, market="US", quick=False):
     for i, t in enumerate(tickers):
         print(f"    [{i+1}/{len(tickers)}] {t} ... ", end="", flush=True)
         try:
-            sr = score_stock_v5(t, macro_data=macro_data)
+            sr = score_stock_v5(t, macro_data=macro_data, market=market)
             if sr is not None:
                 results[t] = {
                     "ml_score": sr["score"],
                     "ml_confidence": sr["confidence"],
-                    "ml_pred_return": (sr["mom_1m"] / 100) if abs(sr["mom_1m"]) < 200 else 0,
+                    "ml_pred_return": None,
                     "ml_r2": sr["walk_forward_r2"],
                     "ml_direction": sr["direction"],
                     "ml_models": "+".join(sr["models_used"]),
                     "ml_rank_pctl": sr["rank_pctl"],
-                    "ml_actual_5d": sr.get("actual_5d", 0),
+                    "ml_actual_5d": sr.get("actual_5d"),
                 }
                 print(f"评分={sr['score']:.3f} {sr['direction']}")
             else:
@@ -201,20 +201,20 @@ def run_factor_scoring(tickers):
 # 3. 新闻情绪评分
 # ═══════════════════════════════════════
 def run_sentiment_scoring(tickers, market="US"):
-    """调用 news_sentiment_v2 获取情绪因子 (支持美股港股)"""
+    """调用统一 FinBERT 新闻模块获取情绪因子 (支持美股港股)"""
     try:
         if market == "HK":
             # 港股情绪: 用关键词快速分析
-            from news_sentiment_v2 import fetch_news, deep_sentiment
+            from finbert_sentiment import fetch_news, deep_sentiment
         else:
-            from news_sentiment_v2 import fetch_news, deep_sentiment
-    except:
+            from finbert_sentiment import fetch_news, deep_sentiment
+    except (ImportError, OSError, ValueError):
         return {}
 
     print(f"  {'📰' if market == 'US' else '🌏'} 新闻情绪分析 ({market}, {len(tickers)}只)...")
 
     # 批量获取新闻
-    from news_sentiment_v2 import fetch_batch_news
+    from finbert_sentiment import fetch_batch_news
     all_news = fetch_batch_news(tickers)
 
     results = {}
@@ -531,7 +531,7 @@ def run_alpha_scoring(results, quick=False):
 # ═══════════════════════════════════════
 # 5c. 组合优化 (P2.3)
 # ═══════════════════════════════════════
-def run_portfolio_optimization(results, top_n=10):
+def run_portfolio_optimization(results, top_n=10, calibration_scores=None, calibration_returns=None):
     """对综合评分 Top 标的用 Kelly 准则做组合优化"""
     top = [s for s in results[:top_n] if s["composite"] > 0.15]
     if len(top) < 2:
@@ -541,16 +541,20 @@ def run_portfolio_optimization(results, top_n=10):
     tickers = [s["ticker"] for s in top]
     ml_scores = {s["ticker"]: s["ml_score"] for s in top}
 
-    print(f"  💼 组合优化 (Top {len(tickers)} 只, Kelly+CovShrink)...")
+    calibrated = calibration_scores is not None and calibration_returns is not None
+    mode = "kelly" if calibrated else "risk_parity"
+    print(f"  💼 组合优化 (Top {len(tickers)} 只, {mode}+CovShrink)...")
     from portfolio_optimizer import optimize_portfolio
 
     try:
         result = optimize_portfolio(
             tickers,
             ml_scores_dict=ml_scores,
-            mode="kelly",
+            mode=mode,
             risk_free_rate=0.05,
             max_leverage=1.0,
+            calibration_scores=calibration_scores,
+            calibration_returns=calibration_returns,
         )
 
         if "allocation" in result:

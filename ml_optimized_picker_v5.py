@@ -37,14 +37,14 @@ _CFG = None
 def load_config():
     global _CFG
     if _CFG is None:
-        with open(_CONFIG_PATH) as f:
+        with open(_CONFIG_PATH, encoding="utf-8") as f:
             full = json.load(f)
         _CFG = full["ml_scoring"]
     return _CFG
 
 CFG = load_config()
 
-warnings.filterwarnings("ignore")
+warnings.filterwarnings("ignore", category=FutureWarning, module="yfinance")
 
 CACHE_DIR = os.path.expanduser("~/.cache/hermes-quant")
 os.makedirs(CACHE_DIR, exist_ok=True)
@@ -151,13 +151,13 @@ from sklearn.linear_model import LogisticRegression
 try:
     import xgboost as xgb
     HAS_XGB = True
-except:
+except ImportError:
     HAS_XGB = False
 
 try:
     import lightgbm as lgb
     HAS_LGB = True
-except:
+except ImportError:
     HAS_LGB = False
 
 # ──── 自适应超参 ────
@@ -216,6 +216,9 @@ FORECAST_HORIZON_MOM = CFG["forecast_horizon_mom"]
 WARMUP = CFG["warmup"]
 
 ADAPTIVE_WINDOWS = CFG["adaptive_windows"]
+PREDICTION_HORIZONS = tuple(CFG.get("prediction_horizons", [FORECAST_HORIZON_SHORT, FORECAST_HORIZON_LONG]))
+PURGE_GAP_DAYS = int(CFG.get("purge_gap_days", max(PREDICTION_HORIZONS)))
+BENCHMARK_BY_MARKET = CFG.get("benchmark_by_market", {"US": "spy", "HK": "hsi"})
 # 新增配置
 MARKET_REGIME_CFG = CFG.get("market_regime", {})
 STOCK_PENALTY_CFG = CFG.get("stock_penalty", {})
@@ -291,6 +294,19 @@ def _cache_path(ticker, period):
     safe_name = ticker.replace(".", "_").replace("^", "_")
     return os.path.join(CACHE_DIR, f"data_{safe_name}_{period}.pkl")
 
+
+def get_cache_metadata(ticker, period="2y"):
+    """Return cache age metadata without changing the DataFrame API."""
+    path = _cache_path(ticker, period)
+    if not os.path.exists(path):
+        return {"cache_path": path, "cache_age_hours": None, "stale": None}
+    age_hours = max(0.0, (time.time() - os.path.getmtime(path)) / 3600.0)
+    return {
+        "cache_path": path,
+        "cache_age_hours": round(age_hours, 3),
+        "stale": age_hours * 3600 > CACHE_TTL,
+    }
+
 def _macro_cache_path():
     return os.path.join(CACHE_DIR, "macro_data.pkl")
 
@@ -337,7 +353,7 @@ def get_cached_data(ticker, period="2y", force_refresh=False):
                                 pickle.dump(df, f)
                             return df
                     return cached
-                except:
+                except (OSError, ValueError, EOFError, pickle.UnpicklingError):
                     return cached  # 增量失败，还是返回缓存
             
             # 缓存超过5天 → 尝试实时拉取，失败才回退
@@ -373,8 +389,8 @@ def get_cached_data(ticker, period="2y", force_refresh=False):
             try:
                 with open(path, "rb") as f:
                     return pickle.load(f)
-            except:
-                pass
+            except (OSError, EOFError, pickle.UnpicklingError) as exc:
+                print(f"  cache read failed: {exc}")
         return pd.DataFrame()
     
     df = _download_yf(ticker, period=period, auto_adjust=True, progress=False)
@@ -405,8 +421,8 @@ def get_macro_data(force_refresh=False):
                     if hasattr(result[k], 'index') and hasattr(result[k].index, 'tz') and result[k].index.tz is not None:
                         result[k].index = result[k].index.tz_localize(None)
                 return result
-            except:
-                pass
+            except (OSError, EOFError, pickle.UnpicklingError) as exc:
+                print(f"  macro cache read failed: {exc}")
     
     macro_tickers = {
         "spy": "SPY",
@@ -435,8 +451,8 @@ def get_macro_data(force_refresh=False):
             if not hsi_series.empty:
                 print(f"  📡 已从腾讯财经获取HSI替代 ({len(hsi_series)}行)")
                 hsi = hsi_series
-        except:
-            pass
+        except (ImportError, OSError, ValueError) as exc:
+            print(f"  HSI fallback unavailable: {exc}")
         
         if os.path.exists(path):
             try:
@@ -460,8 +476,8 @@ def get_macro_data(force_refresh=False):
                         print(f"  ✅ HSI已刷新 ({len(hsi)}行)")
                         with open(path, "wb") as f:
                             pickle.dump(cached, f)
-                except:
-                    pass
+                except (ImportError, OSError, ValueError) as exc:
+                    print(f"  HSI cache refresh failed: {exc}")
                 # 同时尝试akShare刷新SPY/XLK等ETF宏观因子
                 try:
                     import akshare as ak
@@ -479,17 +495,17 @@ def get_macro_data(force_refresh=False):
                                     s.index = s.index.tz_localize(None)
                                 cached[name] = s
                                 refreshed += 1
-                        except:
-                            pass
+                        except (ImportError, OSError, ValueError) as exc:
+                            print(f"  ETF macro refresh failed for {name}: {exc}")
                     if refreshed > 0:
                         print(f"  ✅ akShare刷新{refreshed}个ETF因子")
                         with open(path, "wb") as f:
                             pickle.dump(cached, f)
-                except:
-                    pass
+                except (OSError, ValueError, pickle.PicklingError) as exc:
+                    print(f"  macro cache write failed: {exc}")
                 return cached
-            except:
-                pass
+            except (ImportError, OSError, ValueError) as exc:
+                print(f"  akShare macro fallback failed: {exc}")
         # 无缓存但有腾讯HSI
         try:
             if not hsi.empty:
@@ -498,8 +514,8 @@ def get_macro_data(force_refresh=False):
                     pickle.dump(result, f)
                 print(f"  ✅ 纯腾讯HSI因子 ({len(hsi)}行)")
                 return result
-        except:
-            pass
+        except (OSError, ValueError, KeyError) as exc:
+            print(f"  HSI macro cache write failed: {exc}")
         return {}
     
     # 批量下载 — 使用共享 session
@@ -560,8 +576,8 @@ def get_macro_data(force_refresh=False):
                         close_series.index = close_series.index.tz_localize(None)
                     result[name] = close_series
                     ak_ok += 1
-            except:
-                pass
+            except (ImportError, OSError, ValueError) as exc:
+                print(f"  akShare fallback failed for {name}: {exc}")
         
         if result:
             print(f"  ✅ akShare备用获取 {ak_ok}/{len(macro_tickers)} 个因子")
@@ -571,8 +587,8 @@ def get_macro_data(force_refresh=False):
             with open(path, "wb") as f:
                 pickle.dump(result, f)
             return result
-    except:
-        pass
+    except (ImportError, OSError, ValueError) as exc:
+        print(f"  macro data refresh failed: {exc}")
     
     # 实时拉取完全失败 → 立即回退过期缓存，不再逐个重试
     if os.path.exists(path):
@@ -591,8 +607,8 @@ def get_macro_data(force_refresh=False):
                     cached[k] = s.ffill()
             print(f"  ⚠️  YF 实时拉取失败，回退到过期缓存 ({len(cached)}个因子)")
             return cached
-        except:
-            pass
+        except (OSError, ValueError, KeyError) as exc:
+            print(f"  stale macro cache invalid: {exc}")
     return {}
 
 def get_ticker_sector(ticker):
@@ -605,7 +621,7 @@ def get_ticker_sector(ticker):
 # ═══════════════════════════════════════
 # P2.1: 特征工程 v5 (含宏观因子)
 # ═══════════════════════════════════════
-def build_features_v5(df, macro_data=None, ticker="", cross_section_rank=True):
+def build_features_v5(df, macro_data=None, ticker="", market="US", cross_section_rank=True):
     """v5.2 特征工程: 45个技术面 + 宏观因子"""
     if isinstance(df.columns, pd.MultiIndex):
         df = df.copy()
@@ -770,6 +786,8 @@ def build_features_v5(df, macro_data=None, ticker="", cross_section_rank=True):
 
     # ─── 目标 (双轨) — v5.3: 改为相对SPY超额收益(Alpha) ───
     # 个股绝对收益80%是大盘贡献的，去掉大盘因素后R²有望转正
+    benchmark_name = BENCHMARK_BY_MARKET.get(str(market).upper(), "spy")
+    benchmark = macro_data.get(benchmark_name) if macro_data else None
     stock_21d = pd.Series(close, index=idx).pct_change(FORECAST_HORIZON_LONG)
     if macro_data and "spy" in macro_data:
         spy_21d = macro_data["spy"].reindex(idx, method="ffill").pct_change(FORECAST_HORIZON_LONG)
@@ -785,6 +803,17 @@ def build_features_v5(df, macro_data=None, ticker="", cross_section_rank=True):
     else:
         alpha_5d = stock_5d
     target_5d = alpha_5d.shift(-FORECAST_HORIZON_SHORT)
+
+    # Recompute relative targets with the market-specific benchmark.
+    if benchmark is not None and benchmark_name != "spy":
+        benchmark_21d = benchmark.reindex(idx, method="ffill").pct_change(FORECAST_HORIZON_LONG)
+        benchmark_5d = benchmark.reindex(idx, method="ffill").pct_change(FORECAST_HORIZON_SHORT)
+        target_21d = (stock_21d - benchmark_21d).shift(-FORECAST_HORIZON_LONG)
+        target_5d = (stock_5d - benchmark_5d).shift(-FORECAST_HORIZON_SHORT)
+    elif benchmark_name != "spy" and benchmark is None:
+        # Do not silently use a US benchmark for a non-US market.
+        target_21d = stock_21d.shift(-FORECAST_HORIZON_LONG)
+        target_5d = stock_5d.shift(-FORECAST_HORIZON_SHORT)
     
     # 分类目标: 基于相对收益（个股是否跑赢/跑输大盘±3%）
     target_cls = pd.Series(0, index=idx, dtype=int)
@@ -805,13 +834,30 @@ def build_features_v5(df, macro_data=None, ticker="", cross_section_rank=True):
 # ═══════════════════════════════════════
 # P0.2: Walk-Forward (双轨: 回归+分类)
 # ═══════════════════════════════════════
+def make_purged_time_splits(n_samples, n_splits=TEST_SPLITS, gap=PURGE_GAP_DAYS):
+    """Create expanding time splits with a purge gap for overlapping labels."""
+    if n_samples <= 0 or n_splits <= 0:
+        return []
+    test_size = n_samples // (n_splits + 1)
+    if test_size <= 0:
+        return []
+    splits = []
+    for fold in range(n_splits):
+        train_end = test_size * (fold + 1)
+        test_start = train_end + max(0, int(gap))
+        test_end = min(test_start + test_size, n_samples)
+        if test_start < test_end:
+            splits.append((np.arange(0, train_end), np.arange(test_start, test_end)))
+    return splits
+
+
 def train_model_walk_forward_v5(X, y_reg, y_cls, models_cfg, n_splits=TEST_SPLITS):
     """
     v5.2 Walk-Forward:
     - 回归模型预测21d收益 (用于排序), 自适应超参 + 时间衰减
     - 分类模型预测21d涨跌, 三模型ensemble投票 (RF+XGB+LGB)
     """
-    tscv = TimeSeriesSplit(n_splits=n_splits)
+    split_indices = make_purged_time_splits(len(X), n_splits=n_splits)
     scaler = StandardScaler()
     n_samples = len(X)
 
@@ -827,8 +873,9 @@ def train_model_walk_forward_v5(X, y_reg, y_cls, models_cfg, n_splits=TEST_SPLIT
         reg_model = None
         reg_preds = pd.Series(index=y_reg.index, dtype=np.float64)
         fold_metrics = []
+        cls_artifact = None
 
-        for fold, (tr_idx, te_idx) in enumerate(tscv.split(X)):
+        for fold, (tr_idx, te_idx) in enumerate(split_indices):
             X_tr, X_te = X.iloc[tr_idx], X.iloc[te_idx]
             y_tr = y_reg.iloc[tr_idx]
             X_tr_s = scaler.fit_transform(X_tr)
@@ -868,20 +915,22 @@ def train_model_walk_forward_v5(X, y_reg, y_cls, models_cfg, n_splits=TEST_SPLIT
             cls_model_names = [name for name, cfg in MODELS_CLASSIFICATION.items() if cfg is not None]
             cls_ensemble_preds = np.zeros((len(cls_y_arr), len(cls_model_names)), dtype=np.float32)
             cls_acc_models = []
+            cls_models = []
 
             for cls_i, cls_name in enumerate(cls_model_names):
                 try:
                     cls_m = _build_cls_model(cls_name, n_samples)
                     if cls_m is None:
                         continue
-                    cls_tscv = TimeSeriesSplit(n_splits=min(3, n_splits))
                     fold_preds = np.full(len(cls_y_arr), 0, dtype=np.int8)
-                    for tr_idx, te_idx in cls_tscv.split(cls_X_arr):
+                    cls_splits = make_purged_time_splits(len(cls_X_arr), n_splits=min(3, n_splits))
+                    for tr_idx, te_idx in cls_splits:
                         X_tr_c = cls_X_arr[tr_idx]
                         X_te_c = cls_X_arr[te_idx]
                         y_tr_c = cls_y_arr[tr_idx]
-                        X_tr_c_s = scaler.fit_transform(X_tr_c)
-                        X_te_c_s = scaler.transform(X_te_c)
+                        cls_scaler_fold = StandardScaler()
+                        X_tr_c_s = cls_scaler_fold.fit_transform(X_tr_c)
+                        X_te_c_s = cls_scaler_fold.transform(X_te_c)
                         cls_m_c = _build_cls_model(cls_name, n_samples)
                         if cls_m_c is None:
                             continue
@@ -895,22 +944,31 @@ def train_model_walk_forward_v5(X, y_reg, y_cls, models_cfg, n_splits=TEST_SPLIT
                     # 全量训练
                     cls_m_full = _build_cls_model(cls_name, n_samples)
                     if cls_m_full is not None:
-                        X_cls_s = scaler.fit_transform(cls_X_arr)
+                        cls_scaler = StandardScaler()
+                        X_cls_s = cls_scaler.fit_transform(cls_X_arr)
                         try:
                             cls_m_full.fit(X_cls_s, cls_y_arr, sample_weight=sample_weight[cls_mask])
                         except TypeError:
                             cls_m_full.fit(X_cls_s, cls_y_arr)
-                        cls_pred = cls_m_full.predict(X_cls_s)
-                        cls_ensemble_preds[:, cls_i] = cls_pred
-                except:
+                        # Keep final models separately; validation uses OOS fold predictions.
+                        cls_ensemble_preds[:, cls_i] = fold_preds
+                        cls_models.append((cls_m_full, cls_scaler))
+                except (ValueError, TypeError, RuntimeError) as exc:
+                    print(f"  classification fold failed: {exc}")
                     continue
 
             # ensemble投票: 取三个分类器的均值方向
+            cls_artifact = None
             used_models = np.any(cls_ensemble_preds != 0, axis=0)
             if used_models.sum() > 0:
                 cls_ensemble = np.sign(np.mean(cls_ensemble_preds[:, used_models], axis=1))
                 valid_ensemble = cls_ensemble != 0
                 cls_acc = accuracy_score(cls_y_arr[valid_ensemble], cls_ensemble[valid_ensemble]) if valid_ensemble.sum() > 5 else 0
+                cls_artifact = {
+                    "models": cls_models,
+                    "oos_accuracy": cls_acc,
+                    "oof_pred": cls_ensemble,
+                }
                 cls_model = cls_ensemble  # 存为数组, 后续用于预测
             else:
                 cls_acc = 0
@@ -924,6 +982,7 @@ def train_model_walk_forward_v5(X, y_reg, y_cls, models_cfg, n_splits=TEST_SPLIT
             "reg_r2": reg_r2,
             "reg_preds": reg_preds,
             "cls_model": cls_model,
+            "cls_artifact": cls_artifact,
             "cls_acc": cls_acc,
             "fold_r2_list": fold_metrics,
         }
@@ -1024,8 +1083,8 @@ def load_stock_penalties():
         try:
             with open(path) as f:
                 return json.load(f)
-        except:
-            pass
+        except (OSError, ValueError, json.JSONDecodeError) as exc:
+            print(f"  penalty cache read failed: {exc}")
     return {"penalties": {}, "updated": datetime.now().isoformat()}
 
 def save_stock_penalties(data):
@@ -1125,14 +1184,18 @@ def _momentum_direction_fallback(close_series, df_used):
             return "看跌"
         else:
             return "震荡"
-    except:
+    except (KeyError, TypeError, ValueError):
         return "震荡"
 
-def score_stock_v5(ticker, macro_data=None, period="2y", force_refresh=False):
+def score_stock_v5(ticker, macro_data=None, period="2y", force_refresh=False, market="US", data=None):
     """v5.2 个股评分: Rank一致性评分 + 双轨预测 + 自适应窗口 + 市态检测"""
-    df = get_cached_data(ticker, period=period, force_refresh=force_refresh)
+    df = data.copy() if data is not None else get_cached_data(ticker, period=period, force_refresh=force_refresh)
     if df.empty or len(df) < MIN_TRADING_DAYS:
         return None
+    cache_metadata = get_cache_metadata(ticker, period) if data is None else {
+        "cache_age_hours": None,
+        "stale": False,
+    }
 
     if isinstance(df.columns, pd.MultiIndex):
         df.columns = [c[0] for c in df.columns]
@@ -1169,7 +1232,9 @@ def score_stock_v5(ticker, macro_data=None, period="2y", force_refresh=False):
     low_arr = df_used["Low"].values.astype(float)
     regime_info = detect_market_regime(close_arr, high_arr, low_arr)
 
-    features, target_5d, target_21d, target_cls = build_features_v5(df_used, macro_data, ticker)
+    features, target_5d, target_21d, target_cls = build_features_v5(
+        df_used, macro_data, ticker, market=market
+    )
     if len(features) < WARMUP:
         return None
 
@@ -1275,14 +1340,17 @@ def score_stock_v5(ticker, macro_data=None, period="2y", force_refresh=False):
         ensemble_dirs = []
         # 从各模型的分类结果获取方向信号
         for name in model_names:
-            if results[name]["cls_model"] is not None and results[name]["cls_acc"] > CFG["classification"]["min_accuracy"]:
+            cls_artifact = results[name].get("cls_artifact")
+            if cls_artifact and results[name]["cls_acc"] > CFG["classification"]["min_accuracy"]:
                 # 分类模型是ensemble数组, 用最新值
-                if isinstance(results[name]["cls_model"], np.ndarray):
-                    cls_pred = int(np.sign(np.mean(results[name]["cls_model"][-3:]) or 0))
-                else:
-                    x_latest = X.iloc[-1:].values
-                    x_s = scaler.transform(x_latest)
-                    cls_pred = int(results[name]["cls_model"].predict(x_s)[0])
+                x_latest = X.iloc[-1:].values
+                model_preds = []
+                for cls_model, cls_scaler in cls_artifact["models"]:
+                    x_s = cls_scaler.transform(x_latest)
+                    model_preds.append(int(cls_model.predict(x_s)[0]))
+                cls_pred = int(np.sign(np.mean(model_preds))) if model_preds else 0
+                if cls_pred == 0:
+                    continue
                 ensemble_dirs.append(cls_pred)
                 cls_signals.append({
                     "model": name,
@@ -1329,12 +1397,21 @@ def score_stock_v5(ticker, macro_data=None, period="2y", force_refresh=False):
         last_close = 0.0
         closes = closes_raw
 
-    actual_5d = (last_close / closes[-min(6, len(closes))] - 1) * 100 if len(closes) >= 2 else 0
+    trailing_return_5d = (last_close / closes[-min(6, len(closes))] - 1) * 100 if len(closes) >= 2 else 0
+    trailing_return_21d = (last_close / closes[-21] - 1) * 100 if len(closes) >= 21 else 0
     mom_1m = (last_close / closes[-21] - 1) * 100 if len(closes) >= 21 else 0
     mom_3m = (last_close / closes[-63] - 1) * 100 if len(closes) >= 63 else 0
 
     return {
         "ticker": ticker,
+        "market": str(market).upper(),
+        "benchmark": BENCHMARK_BY_MARKET.get(str(market).upper(), "spy"),
+        "benchmark_status": "available" if (
+            macro_data is not None and
+            BENCHMARK_BY_MARKET.get(str(market).upper(), "spy") in macro_data
+        ) else "missing",
+        "cache_age_hours": cache_metadata.get("cache_age_hours"),
+        "data_stale": cache_metadata.get("stale"),
         "price": round(float(last_close), 2) if last_close > 0 else 0.0,
         "score": round(final_score, 4),          # v5: 新评分(0~1)
         "rank_pctl": round(latest_rank, 4),       # 排名百分位
@@ -1343,7 +1420,16 @@ def score_stock_v5(ticker, macro_data=None, period="2y", force_refresh=False):
         "direction": direction,                    # 分类看涨/看跌
         "cls_details": cls_signals[:3],            # 分类详情
         "adaptive_window": best_w,
-        "actual_5d": round(actual_5d, 2),
+        # The future realized return is unavailable at signal time. Keep the
+        # legacy field only for schema compatibility and expose trailing data
+        # under an explicitly non-predictive name.
+        "actual_5d": None,
+        "trailing_return_5d": round(trailing_return_5d, 2),
+        "trailing_return_21d": round(trailing_return_21d, 2),
+        "signal_date": str(df_used.index[last_valid_idx].date()) if valid_mask.any() else None,
+        "data_asof": str(df_used.index[last_valid_idx].date()) if valid_mask.any() else None,
+        "target_horizon_days": FORECAST_HORIZON_SHORT,
+        "direction_horizon_days": FORECAST_HORIZON_LONG,
         "mom_1m": round(mom_1m, 2),
         "mom_3m": round(mom_3m, 2),
         "models_used": model_names,
@@ -1394,7 +1480,9 @@ def run_ml_picking_v5(tickers=None, market="US", macro_data=None,
             sys.stdout.write(f"  [{i+1}/{total}] {t:<10} ... ")
             sys.stdout.flush()
         try:
-            sr = score_stock_v5(t, macro_data=macro_data, force_refresh=force_refresh)
+            sr = score_stock_v5(
+                t, macro_data=macro_data, force_refresh=force_refresh, market=market
+            )
             if sr is not None:
                 results.append(sr)
                 tag = "★" if sr["score"] > 0.5 else "·"
@@ -1670,7 +1758,11 @@ if __name__ == "__main__":
 
                 # 收集所有 ticker
                 all_tickers = list(set(r["ticker"] for r in all_results))
-                sentiment_factors = build_sentiment_factors(all_tickers)
+                sentiment_factors = build_sentiment_factors(
+                    all_tickers,
+                    signal_time=datetime.now(),
+                    archive_root=os.path.join(CACHE_DIR, "backtest"),
+                )
 
                 llm_count = sum(1 for f in sentiment_factors.values() if f.get("method") == "llm")
                 finbert_count = sum(1 for f in sentiment_factors.values() if f.get("method") == "finbert")
