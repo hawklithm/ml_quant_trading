@@ -64,15 +64,15 @@ TUNE_PRESETS = {
     # ─── 方向阈值自适应预设 (Fix1/Fix4) ───
     "widen_bias_bearish": {
         "desc": "连续偏看跌, 调低看跌阈值",
-        "steps": [{"bearish": -0.25}, {"bearish": -0.30}],
+        "steps": [{"bearish": -0.30}, {"bearish": -0.35}],
     },
     "widen_bias_bullish": {
         "desc": "连续偏看涨, 调高看涨阈值",
-        "steps": [{"bullish": 0.25}, {"bullish": 0.30}],
+        "steps": [{"bullish": 0.35}, {"bullish": 0.40}],
     },
     "widen_all": {
         "desc": "低信噪比, 放宽双向阈值",
-        "steps": [{"bullish": 0.25, "bearish": -0.25}],
+        "steps": [{"bullish": 0.35, "bearish": -0.30}],
     },
     "reset_bias": {
         "desc": "偏差已消除, 恢复默认阈值",
