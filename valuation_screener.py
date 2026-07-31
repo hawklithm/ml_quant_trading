@@ -13,14 +13,14 @@ valuation_screener.py — 智能估值选股器
 用法:
   python valuation_screener.py --market US
   python valuation_screener.py --market HK --force-refresh
-  python valuation_screener.py --market US --top 10 --detail
+  python valuation_screener.py --market US --top 10 --save
 
 依赖:
   yfinance, numpy, pandas, scipy
   ml_optimized_picker_v5.py (获取 watchlist + sector 信息)
 """
 
-import sys, os, json, time
+import sys, os, json, time, hashlib, tempfile
 import numpy as np
 import pandas as pd
 from datetime import datetime
@@ -29,20 +29,97 @@ from scipy.stats import zscore
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from ml_optimized_picker_v5 import US_WATCHLIST, HK_WATCHLIST, NAMES_HK
 
-# ─── 配置 ───
-RISK_FREE_RATE = 0.045        # 无风险利率 ~4.5%
-EQUITY_RISK_PREMIUM = 0.055   # 股权风险溢价 ~5.5%
-REQUIRED_RETURN = RISK_FREE_RATE + EQUITY_RISK_PREMIUM  # ~10%
+# ─── 配置：按市场显式区分估值假设 ───
+MARKET_ASSUMPTIONS = {
+    "US": {"risk_free_rate": 0.045, "equity_risk_premium": 0.055, "terminal_growth": 0.020},
+    "HK": {"risk_free_rate": 0.035, "equity_risk_premium": 0.060, "terminal_growth": 0.020},
+}
+RISK_FREE_RATE = MARKET_ASSUMPTIONS["US"]["risk_free_rate"]
+EQUITY_RISK_PREMIUM = MARKET_ASSUMPTIONS["US"]["equity_risk_premium"]
+REQUIRED_RETURN = RISK_FREE_RATE + EQUITY_RISK_PREMIUM
 CACHE_DIR = os.path.expanduser("~/.cache/hermes-quant")
 os.makedirs(CACHE_DIR, exist_ok=True)
+CACHE_TTL_SECONDS = 24 * 60 * 60
+CACHE_SCHEMA_VERSION = 2
+MODEL_VERSION = "valuation_dcf_v2"
 
 # 估值方法权重 (等权)
 METHOD_WEIGHTS = {
     "graham": 0.30,
     "comparable_pe": 0.30,
-    "fcf_yield": 0.25,
+    "dcf": 0.25,
     "peg_signal": 0.15,
 }
+
+VALUATION_POLICIES = {
+    "financial": {"methods": {"graham", "comparable_pe"}, "keywords": ("bank", "insurance", "financial", "金融", "银行", "保险")},
+    "reit": {"methods": {"comparable_pe", "dcf"}, "keywords": ("reit", "real estate", "房地产", "地产")},
+    "cyclical": {"methods": {"comparable_pe", "dcf"}, "keywords": ("energy", "materials", "mining", "oil", "gas", "能源", "材料")},
+    "default": {"methods": set(METHOD_WEIGHTS), "keywords": ()},
+}
+
+
+def _market_assumptions(market):
+    return MARKET_ASSUMPTIONS.get(str(market).upper(), MARKET_ASSUMPTIONS["US"])
+
+
+def _valuation_policy(industry, sector):
+    text = f"{industry or ''} {sector or ''}".lower()
+    for name, policy in VALUATION_POLICIES.items():
+        if name != "default" and any(keyword.lower() in text for keyword in policy["keywords"]):
+            return name, sorted(policy["methods"])
+    return "default", sorted(VALUATION_POLICIES["default"]["methods"])
+
+
+def _fundamentals_cache_path(market):
+    return os.path.join(CACHE_DIR, f"valuation_fundamentals_{str(market).upper()}.json")
+
+
+def _read_fundamentals_cache(market, tickers):
+    path = _fundamentals_cache_path(market)
+    if not os.path.exists(path) or time.time() - os.path.getmtime(path) > CACHE_TTL_SECONDS:
+        return None
+    try:
+        with open(path, encoding="utf-8") as handle:
+            payload = json.load(handle)
+        if payload.get("schema_version") != CACHE_SCHEMA_VERSION or payload.get("model_version") != MODEL_VERSION:
+            return None
+        records = payload.get("records", [])
+        wanted = set(tickers)
+        if wanted and not wanted.issubset({record.get("ticker") for record in records}):
+            return None
+        return records
+    except (OSError, ValueError, json.JSONDecodeError):
+        return None
+
+
+def _write_fundamentals_cache(market, records, errors=None):
+    path = _fundamentals_cache_path(market)
+    directory = os.path.dirname(path)
+    fd, temporary = tempfile.mkstemp(prefix="valuation_", suffix=".tmp", dir=directory, text=True)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            json.dump({"schema_version": CACHE_SCHEMA_VERSION, "model_version": MODEL_VERSION, "market": market, "fetched_at": datetime.now().isoformat(), "records": records, "errors": errors or []}, handle, ensure_ascii=False, indent=2, default=str)
+        os.replace(temporary, path)
+    finally:
+        if os.path.exists(temporary):
+            os.unlink(temporary)
+
+
+def _dcf_per_share(fcf_ps, growth, discount_rate, terminal_growth, net_debt_ps=0.0, dilution_rate=0.0):
+    """Five-year FCFF DCF, subtracting net debt and allowing bounded dilution."""
+    if fcf_ps is None or not np.isfinite(fcf_ps) or fcf_ps <= 0:
+        return None
+    growth = float(np.clip(growth if growth is not None and np.isfinite(growth) else 0.0, -0.05, 0.15))
+    if discount_rate <= terminal_growth:
+        return None
+    value = 0.0
+    for year in range(1, 6):
+        value += fcf_ps * ((1 + growth) ** year) / ((1 + discount_rate) ** year)
+    terminal = fcf_ps * ((1 + growth) ** 5) * (1 + terminal_growth) / (discount_rate - terminal_growth)
+    enterprise_value = value + terminal / ((1 + discount_rate) ** 5)
+    equity_value = enterprise_value - float(net_debt_ps or 0.0)
+    return equity_value / ((1 + max(float(dilution_rate), 0.0)) ** 5) if equity_value > 0 else None
 
 
 def _sector_median(df_tickers, field):
@@ -54,13 +131,24 @@ def _sector_median(df_tickers, field):
     return float(np.median(vals))
 
 
-def fetch_fundamentals(tickers, force_refresh=False):
+def fetch_fundamentals(tickers, force_refresh=False, market="US"):
     """批量获取每只股票的基本面数据
 
     返回: [{ticker, sector, price, eps, bvps, fcf_ps, pe, forward_pe, pb, ...}]
     """
+    market = str(market).upper()
+    if not force_refresh:
+        cached = _read_fundamentals_cache(market, tickers)
+        if cached is not None:
+            print(f"  使用估值基本面缓存: {len(cached)} 只")
+            fetch_fundamentals.last_errors = []
+            return cached
+
     results = []
+    errors = []
     total = len(tickers)
+    assumptions = _market_assumptions(market)
+    required_return = assumptions["risk_free_rate"] + assumptions["equity_risk_premium"]
 
     for i, t in enumerate(tickers):
         sys.stdout.write(f"\r  [{i+1}/{total}] {t:<12} ... ")
@@ -83,7 +171,11 @@ def fetch_fundamentals(tickers, force_refresh=False):
             shares = info.get("sharesOutstanding")
             sector = info.get("sector") or "Other"
             industry = info.get("industry") or ""
+            valuation_group = industry or sector
+            valuation_policy, allowed_methods = _valuation_policy(industry, sector)
             market_cap = info.get("marketCap")
+            total_debt = info.get("totalDebt")
+            cash_total = info.get("totalCash")
             trailing_pe = info.get("trailingPE")
             forward_pe = info.get("forwardPE")
             pb = info.get("priceToBook")
@@ -97,12 +189,19 @@ def fetch_fundamentals(tickers, force_refresh=False):
             debt_equity = info.get("debtToEquity")
             target_mean = info.get("targetMeanPrice")
 
-            fcf_ps = (fcf / shares) if (fcf and shares and shares > 0) else None
+            fcf_ps = (
+                fcf / shares
+                if fcf is not None and shares is not None
+                and np.isfinite(fcf) and np.isfinite(shares) and shares > 0
+                else None
+            )
 
             record = {
                 "ticker": t,
                 "name": NAMES_HK.get(t, t),
                 "sector": sector,
+                "industry": industry,
+                "valuation_group": valuation_group,
                 "price": price,
                 "eps": eps,
                 "bvps": bvps,
@@ -119,9 +218,17 @@ def fetch_fundamentals(tickers, force_refresh=False):
                 "profit_margin": profit_margin,
                 "debt_equity": debt_equity,
                 "market_cap": market_cap,
+                "total_debt": total_debt,
+                "cash_total": cash_total,
                 "target_mean": target_mean,
                 "fcf": fcf,
                 "shares": shares,
+                "data_asof": datetime.now().isoformat(),
+                "market": market,
+                "required_return": required_return,
+                "terminal_growth": assumptions["terminal_growth"],
+                "valuation_policy": valuation_policy,
+                "allowed_valuation_methods": allowed_methods,
             }
 
             # ─── 估值计算 ───
@@ -143,9 +250,17 @@ def fetch_fundamentals(tickers, force_refresh=False):
 
             # 3. FCF Yield 估值
             fcf_fv = None
+            growth_for_dcf = earnings_growth if earnings_growth is not None else revenue_growth
+            net_debt_ps = 0.0
+            if total_debt is not None and cash_total is not None and shares is not None and shares > 0:
+                net_debt_ps = (total_debt - cash_total) / shares
             if fcf_ps and fcf_ps > 0:
-                fcf_fv = fcf_ps / REQUIRED_RETURN
+                fcf_fv = _dcf_per_share(
+                    fcf_ps, growth_for_dcf, required_return, assumptions["terminal_growth"],
+                    net_debt_ps=net_debt_ps,
+                )
             record["fcf_fv"] = round(fcf_fv, 2) if fcf_fv else None
+            record["dcf_fv"] = record["fcf_fv"]
             record["fcf_discount"] = (
                 round((fcf_fv - price) / fcf_fv * 100, 1)
                 if fcf_fv and fcf_fv > 0 else None
@@ -153,26 +268,30 @@ def fetch_fundamentals(tickers, force_refresh=False):
 
             # 4. PEG 信号 (越小越低估)
             peg = None
-            usable_pe = forward_pe or trailing_pe
-            usable_growth = earnings_growth or revenue_growth
+            usable_pe = forward_pe if forward_pe is not None and np.isfinite(forward_pe) and forward_pe > 0 else trailing_pe
+            usable_growth = earnings_growth if earnings_growth is not None and np.isfinite(earnings_growth) and earnings_growth > 0 else revenue_growth
             if usable_pe and usable_growth and usable_pe > 0 and usable_growth > 0:
-                peg = usable_pe / (usable_growth * 100)
+                growth_percent = usable_growth if usable_growth > 5 else usable_growth * 100
+                peg = usable_pe / growth_percent if growth_percent > 0 else None
             record["peg"] = round(peg, 2) if peg else None
 
             results.append(record)
             print(f"✓ ${price:.1f} EPS={eps or 'N/A'}")
 
         except Exception as e:
+            errors.append({"ticker": t, "status": "error", "reason": str(e), "data_asof": datetime.now().isoformat(), "market": market})
             print(f"✗ {e}")
 
         # 防限流
         if i < total - 1:
             time.sleep(0.3)
 
+    _write_fundamentals_cache(market, results, errors)
+    fetch_fundamentals.last_errors = errors
     return results
 
 
-def compute_valuation_scores(records):
+def compute_valuation_scores(records, market="US"):
     """对估值结果进行聚合评分
 
     1. 按行业计算 comparable PE 估值
@@ -183,21 +302,35 @@ def compute_valuation_scores(records):
         return records
 
     df = pd.DataFrame(records)
+    for record in records:
+        if "allowed_valuation_methods" not in record:
+            policy, methods = _valuation_policy(record.get("industry", ""), record.get("sector", "Other"))
+            record["valuation_policy"] = policy
+            record["allowed_valuation_methods"] = methods
 
     # ─── Comparable PE: 按行业中位数 ───
     sector_medians = {}
-    for sector, group in df.groupby("sector"):
+    group_column = "valuation_group" if "valuation_group" in df.columns else "sector"
+    for group_name, group in df.groupby(group_column):
         pes = group["trailing_pe"].dropna()
         pes = pes[(pes > 0) & (pes < 100)]  # 过滤异常值
         if len(pes) >= 3:
-            sector_medians[sector] = pes.median()
+            sector_medians[group_name] = pes.median()
 
     for i, r in enumerate(records):
-        s = r.get("sector", "Other")
+        s = r.get(group_column, r.get("sector", "Other"))
         med_pe = sector_medians.get(s)
         eps = r.get("eps")
-        if med_pe and eps and eps > 0:
-            fv = med_pe * eps
+        own_pe = r.get("trailing_pe")
+        peer_values = df.loc[df[group_column] == s, "trailing_pe"].dropna()
+        peer_values = peer_values[(peer_values > 0) & (peer_values < 100)]
+        if len(peer_values) >= 3 and own_pe is not None:
+            own_indices = peer_values.index[peer_values == own_pe]
+            if len(own_indices) > 0:
+                peer_values = peer_values.drop(own_indices[0])
+        peer_median = peer_values.median() if len(peer_values) >= 2 else med_pe
+        if peer_median and eps and eps > 0:
+            fv = peer_median * eps
             r["comparable_pe_fv"] = round(fv, 2)
             r["comparable_pe_discount"] = round((fv - r["price"]) / fv * 100, 1) if fv > 0 else None
 
@@ -233,7 +366,7 @@ def compute_valuation_scores(records):
         for i, r in enumerate(records):
             r["_z_fcf"] = z[i] if not np.isnan(z[i]) else 0
         score_cols.append("_z_fcf")
-        score_labels.append("fcf_yield")
+        score_labels.append("dcf")
 
     # PEG (越小越好 → 取负号后z-score)
     pegs = [r.get("peg") for r in records]
@@ -251,6 +384,9 @@ def compute_valuation_scores(records):
         total_weight = 0
         weighted_sum = 0
         for col, label in zip(score_cols, score_labels):
+            allowed_methods = set(r.get("allowed_valuation_methods", METHOD_WEIGHTS))
+            if label not in allowed_methods:
+                continue
             w = METHOD_WEIGHTS.get(label, 0.2)
             v = r.get(col, 0)
             if v != 0 or col in r:  # 至少参与过计算
@@ -259,6 +395,40 @@ def compute_valuation_scores(records):
         composite = weighted_sum / total_weight if total_weight > 0 else 0
         # 映射到 0-100 分: z-score 在 [-3, 3] 范围内有意义
         r["value_score"] = round(min(100, max(0, (composite / 3 + 1) * 50)), 1)
+
+        discount_methods = {
+            "graham_discount": "graham",
+            "comparable_pe_discount": "comparable_pe",
+            "fcf_discount": "dcf",
+        }
+        allowed_methods = set(r.get("allowed_valuation_methods", METHOD_WEIGHTS))
+        discounts = [
+            r.get(field) for field, method in discount_methods.items()
+            if method in allowed_methods
+        ]
+        discounts = [float(value) for value in discounts if value is not None and np.isfinite(value)]
+        r["valuation_coverage"] = len(discounts)
+        r["average_discount"] = round(float(np.mean(discounts)), 1) if discounts else None
+        roe = r.get("roe")
+        margin = r.get("profit_margin")
+        debt = r.get("debt_equity")
+        quality_values = [roe, margin, debt]
+        quality_complete = all(value is not None and np.isfinite(value) for value in quality_values)
+        quality_checks = [roe > -0.20, margin > -0.20, debt < 500] if quality_complete else []
+        r["quality_status"] = "complete" if quality_complete else "incomplete"
+        r["quality_pass"] = bool(quality_complete and all(quality_checks))
+        pe = r.get("forward_pe") if r.get("forward_pe") is not None else r.get("trailing_pe")
+        r["hard_valuation_pass"] = bool(
+            (pe is None or not np.isfinite(pe) or pe <= 80)
+            and (r.get("peg") is None or r.get("peg") <= 3)
+        )
+        r["eligible"] = bool(
+            r["valuation_coverage"] >= 2
+            and r["average_discount"] is not None
+            and r["average_discount"] >= 10
+            and r["quality_pass"]
+            and r["hard_valuation_pass"]
+        )
 
     return records
 
@@ -281,11 +451,12 @@ def print_valuation_report(records, market, top_n=20):
 
     # 统计概要
     n_valued = sum(1 for r in records if r.get("value_score", 0) > 0)
+    n_eligible = sum(1 for r in records if r.get("eligible"))
     n_graham = sum(1 for r in records if r.get("graham_fv"))
     n_fcf = sum(1 for r in records if r.get("fcf_fv"))
     n_pe_comp = sum(1 for r in records if r.get("comparable_pe_fv"))
     n_peg = sum(1 for r in records if r.get("peg"))
-    print(f"  评估: {len(records)} 只 | 估值有效: {n_valued} 只")
+    print(f"  评估: {len(records)} 只 | 估值有效: {n_valued} 只 | 安全边际合格: {n_eligible} 只")
     print(f"  方法覆盖率: Graham={n_graham} ComparablePE={n_pe_comp} FCF={n_fcf} PEG={n_peg}")
     print(f"  估值方法权重: {', '.join(f'{k}={v:.0%}' for k,v in METHOD_WEIGHTS.items())}")
 
@@ -352,7 +523,7 @@ def print_valuation_report(records, market, top_n=20):
         if r.get("fcf_fv"):
             d = r.get("fcf_discount", 0)
             sign = "折价" if d > 0 else "溢价"
-            print(f"     FCF估值: ${r['fcf_fv']:.1f} ({sign} {abs(d):.1f}%, 要求回报率{REQUIRED_RETURN:.0%})")
+            print(f"     DCF估值: ${r['fcf_fv']:.1f} ({sign} {abs(d):.1f}%, 要求回报率{r.get('required_return', REQUIRED_RETURN):.1%})")
 
         if r.get("peg"):
             peg_label = "低估" if r["peg"] < 1 else "合理" if r["peg"] < 2 else "高估"
@@ -381,6 +552,10 @@ def print_valuation_report(records, market, top_n=20):
         if r.get("market_cap"):
             fundamentals.append(f"市值={r['market_cap']/1e9:.1f}B")
 
+        average_discount = r.get("average_discount")
+        average_discount = float(average_discount) if average_discount is not None else 0.0
+        print(f"     安全边际: {average_discount:.1f}% | 覆盖方法: {r.get('valuation_coverage', 0)} | {'可进入候选池' if r.get('eligible') else '仅供观察'}")
+
         if fundamentals:
             print(f"     基本面: {' | '.join(fundamentals)}")
 
@@ -389,10 +564,12 @@ def print_valuation_report(records, market, top_n=20):
             print(f"     分析师目标价: ${r['target_mean']:.1f} (潜在{'上涨' if diff > 0 else '下跌'}{abs(diff):.1f}%)")
 
 
-def save_results(records, market):
+def save_results(records, market, errors=None):
     """保存估值结果到 JSON"""
     timestamp = datetime.now().strftime("%Y%m%d_%H%M")
-    safe = [r for r in records if r.get("value_score", 0) > 0]
+    safe = [r for r in records if r.get("eligible")]
+    with open(os.path.join(os.path.dirname(__file__), "v5_config.json"), "rb") as config_file:
+        config_hash = hashlib.sha256(config_file.read()).hexdigest()
     path = os.path.join(CACHE_DIR, f"valuation_{market}_{timestamp}.json")
     with open(path, "w") as f:
         json.dump({
@@ -400,6 +577,9 @@ def save_results(records, market):
             "generated_at": datetime.now().isoformat(),
             "total": len(records),
             "valued": len(safe),
+            "errors": errors or [],
+            "config_sha256": config_hash,
+            "assumptions": MARKET_ASSUMPTIONS.get(market, MARKET_ASSUMPTIONS["US"]),
             "results": safe,
         }, f, indent=2, default=str)
     print(f"\n  💾 已保存: {path}")
@@ -423,15 +603,20 @@ if __name__ == "__main__":
     label = "港股" if args.market == "HK" else "美股"
 
     print(f"📊 {label}估值分析 — {len(tickers)} 只标的")
-    print(f"  请求回报率: {REQUIRED_RETURN:.0%} = 无风险{RISK_FREE_RATE:.1%} + ERP{EQUITY_RISK_PREMIUM:.1%}")
+    assumptions = _market_assumptions(market)
+    required_return = assumptions["risk_free_rate"] + assumptions["equity_risk_premium"]
+    print(f"  请求回报率: {required_return:.0%} = 无风险{assumptions['risk_free_rate']:.1%} + ERP{assumptions['equity_risk_premium']:.1%}")
 
-    records = fetch_fundamentals(tickers, force_refresh=args.force_refresh)
+    records = fetch_fundamentals(tickers, force_refresh=args.force_refresh, market=args.market)
     if not records:
         print("❌ 没有获取到基本面数据")
         sys.exit(1)
 
-    records = compute_valuation_scores(records)
+    records = compute_valuation_scores(records, market=args.market)
     print_valuation_report(records, args.market, top_n=args.top)
 
+    errors = getattr(fetch_fundamentals, "last_errors", [])
+    if errors:
+        print(f"  数据获取失败: {len(errors)} 只，详情已写入结果 metadata")
     if args.save:
-        save_results(records, args.market)
+        save_results(records, args.market, errors=errors)

@@ -402,3 +402,5 @@
 - `cross_validate_picker.py` 已改为 argparse，支持 `--calibration-csv`；配置读取统一使用 UTF-8，并通过 `--help` 验证。
 - PaperBroker 现在复用统一交易成本模型，手续费会进入现金、持仓平均成本和卖出 PnL；校准映射发现非单调 OOS 桶收益时会拒绝进入 Kelly。
 - cron_market_job.py 已修复方向阈值恢复漂移、港股 SPY 基准错配、pre/post 情绪重复融合、复盘基准归因字段缺失和重复加载 v5 模块问题，并增加回归测试。
+- valuation_screener.py 已增加按市场的估值假设、基本面缓存和 force-refresh、五年 DCF、industry 可比 PE、稳健 PEG、质量门槛、绝对安全边际和配置哈希；其结果仍只作为候选池，未接入真实交易。
+- valuation_screener.py 第二轮增强：DCF 扣除净债务并支持稀释假设；缓存增加 schema/model 版本并使用原子替换；逐票抓取失败写入 errors；质量数据不完整不得进入 eligible；加入 PE/PEG 硬门槛；按金融、REIT、周期行业限制可用估值方法。
