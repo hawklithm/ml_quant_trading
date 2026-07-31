@@ -401,3 +401,4 @@
 - 已删除旧 v1/v4 picker、旧 news sentiment、旧 ml_deep_scan 和 debug 运行入口，迁移说明保留在 `legacy/README.md`；维护入口统一到 v5、FinBERT、quant 和 cron。
 - `cross_validate_picker.py` 已改为 argparse，支持 `--calibration-csv`；配置读取统一使用 UTF-8，并通过 `--help` 验证。
 - PaperBroker 现在复用统一交易成本模型，手续费会进入现金、持仓平均成本和卖出 PnL；校准映射发现非单调 OOS 桶收益时会拒绝进入 Kelly。
+- cron_market_job.py 已修复方向阈值恢复漂移、港股 SPY 基准错配、pre/post 情绪重复融合、复盘基准归因字段缺失和重复加载 v5 模块问题，并增加回归测试。

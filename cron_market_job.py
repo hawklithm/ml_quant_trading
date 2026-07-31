@@ -76,9 +76,19 @@ TUNE_PRESETS = {
     },
     "reset_bias": {
         "desc": "偏差已消除, 恢复默认阈值",
-        "steps": [{"bullish": 0.15, "bearish": -0.15}],
+        "steps": [{"bullish": 0.30, "bearish": -0.25}],
     },
 }
+
+
+def _benchmark_ticker(market):
+    """Return the price-provider ticker used for market-relative review."""
+    return "^HSI" if str(market).upper() == "HK" else "SPY"
+
+
+def _pending_sentiment_predictions(predictions):
+    """Keep sentiment application idempotent across pre/post cron runs."""
+    return [prediction for prediction in predictions if not prediction.get("sentiment_applied")]
 
 NAMES_HK = {
     "0700.HK":"腾讯","9988.HK":"阿里","9999.HK":"网易","1810.HK":"小米",
@@ -289,6 +299,8 @@ def run_pre_market(market, sentiment=False):
                     p["score"] = fused
                     p["sentiment_adj"] = adj
                     p["event_adj"] = evt_adj
+                    p["sentiment_applied"] = True
+                    p["sentiment_signal_time"] = datetime.now().isoformat()
                     if sf.get("events"):
                         event_stocks.append((t, sf["event_labels"], sf.get("event_discount", 1.0)))
 
@@ -325,7 +337,6 @@ def run_pre_market(market, sentiment=False):
     # ─── 数据归档（回测支持） ───
     if HAS_ARCHIVER:
         try:
-            v5 = load_v5_module()
             macro_data = v5.get("get_macro_data")()
             full_archive_from_run(market, predictions, macro_data)
         except Exception as e:
@@ -362,7 +373,6 @@ def run_post_market(market, sentiment=False):
         return
 
     # 复用缓存: 用 get_cached_data 替代直接 yf.download, 减少YF调用
-    v5 = load_v5_module()
     get_cached = v5["get_cached_data"]
 
     # 下载今日收盘数据对比
@@ -394,18 +404,24 @@ def run_post_market(market, sentiment=False):
                 chg_5d = chg_1d
                 review_chg = chg_1d
             
-            # SPY相对收益（alpha）
+            # 相对收益（alpha）：港股使用恒指，美股使用 SPY。
+            benchmark_ticker = _benchmark_ticker(market)
             try:
-                spy_df = get_cached("SPY", period="1y", force_refresh=False)
-                if not spy_df.empty and len(spy_df) >= 6:
-                    spy_closes = spy_df["Close"].values.astype(float)
-                    spy_5d = (spy_closes[-1] / spy_closes[-6] - 1) * 100
-                    alpha_5d = chg_5d - spy_5d
+                benchmark_df = get_cached(benchmark_ticker, period="1y", force_refresh=False)
+                if not benchmark_df.empty and len(benchmark_df) >= 6:
+                    benchmark_closes = benchmark_df["Close"].values.astype(float)
+                    benchmark_5d = (benchmark_closes[-1] / benchmark_closes[-6] - 1) * 100
+                    alpha_5d = chg_5d - benchmark_5d
+                    benchmark_status = "ok"
                 else:
                     alpha_5d = 0
-            except (KeyError, TypeError, ValueError) as exc:
-                print(f"  config proposal skipped: {exc}")
+                    benchmark_5d = None
+                    benchmark_status = "unavailable"
+            except (KeyError, TypeError, ValueError, OSError) as exc:
+                print(f"  benchmark data unavailable ({benchmark_ticker}): {exc}")
                 alpha_5d = 0
+                benchmark_5d = None
+                benchmark_status = "error"
 
             # 判断方向是否正确（基于5日涨跌幅）—— 阈值±1.5%避免过窄判定
             pred_dir = p["direction"]
@@ -430,6 +446,9 @@ def run_post_market(market, sentiment=False):
                 "actual_chg": round(chg_1d, 2),   # 单日涨跌幅保留供参考
                 "chg_5d": round(chg_5d, 2),       # 5日涨跌幅
                 "alpha_5d": round(alpha_5d, 4),   # 5日超额收益
+                "benchmark_ticker": benchmark_ticker,
+                "benchmark_return_5d": round(benchmark_5d, 4) if benchmark_5d is not None else None,
+                "benchmark_status": benchmark_status,
                 "actual_dir": actual_dir,
                 "correct": correct,
                 "price": p.get("price", 0),
@@ -467,6 +486,21 @@ def run_post_market(market, sentiment=False):
         bias = "偏看涨(实际跌多于涨)"
     else:
         bias = ""
+
+    benchmark_rows = [
+        c for c in compare
+        if c.get("benchmark_status") == "ok"
+        and c.get("benchmark_return_5d") is not None
+        and np.isfinite(c.get("alpha_5d", np.nan))
+    ]
+    benchmark_ticker = benchmark_rows[0]["benchmark_ticker"] if benchmark_rows else _benchmark_ticker(market)
+    benchmark_summary = {
+        "ticker": benchmark_ticker,
+        "status": "ok" if benchmark_rows else "unavailable",
+        "benchmark_return_5d": round(float(np.mean([c["benchmark_return_5d"] for c in benchmark_rows])), 4) if benchmark_rows else None,
+        "mean_alpha_5d": round(float(np.mean([c["alpha_5d"] for c in benchmark_rows])), 4) if benchmark_rows else None,
+        "observations": len(benchmark_rows),
+    }
 
     # ─── 自动生成优化建议 ───
     suggestions = []
@@ -528,7 +562,7 @@ def run_post_market(market, sentiment=False):
                 "keys": ["ml_scoring", "direction_thresholds"],
                 "old": None,
                 "new": "reset_bias",
-                "reason": f"偏差已消除, 恢复默认阈值±0.15"
+                "reason": "偏差已消除, 恢复 v5_config.json 默认阈值 bullish=0.30/bearish=-0.25"
             })
             actions_taken.append("恢复默认方向阈值(偏差已消除)")
         state["_bias_adapt"] = {}
@@ -693,6 +727,7 @@ def run_post_market(market, sentiment=False):
         "suggestions": suggestions,
         "actions_taken": actions_taken,
         "config_changes": config_changes,
+        "benchmark": benchmark_summary,
     }
     state.setdefault("optimizations", []).append(opt_record)
     state.setdefault("prediction_history", []).append({
@@ -740,13 +775,14 @@ def run_post_market(market, sentiment=False):
     # 保存优化记录 (更新后保存)
 
     # ─── 异常事件检测 (--sentiment) ───
-    if sentiment and predictions:
+    unadjusted_predictions = _pending_sentiment_predictions(predictions)
+    if sentiment and unadjusted_predictions:
         print(f"\n  📰 复盘情绪 + 异常事件检测...")
         try:
             from finbert_sentiment import build_sentiment_factors, sentiment_boost
             import numpy as np
 
-            all_tickers = [p["ticker"] for p in predictions]
+            all_tickers = [p["ticker"] for p in unadjusted_predictions]
             sentiment_factors = build_sentiment_factors(
                 all_tickers,
                 signal_time=datetime.now(),
@@ -765,7 +801,7 @@ def run_post_market(market, sentiment=False):
                 else:
                     cross_section_raw.append(None)
 
-            for idx, p in enumerate(predictions):
+            for idx, p in enumerate(unadjusted_predictions):
                 t = p["ticker"]
                 sf = sentiment_factors.get(t, {})
                 if sf and sf.get("news_count", 0) > 0:
@@ -776,6 +812,8 @@ def run_post_market(market, sentiment=False):
                     p["score"] = fused
                     p["sentiment_adj"] = adj
                     p["event_adj"] = evt_adj
+                    p["sentiment_applied"] = True
+                    p["sentiment_signal_time"] = datetime.now().isoformat()
                     if adj or evt_adj:
                         print(f"      {t}: {original:.3f} → {fused:.3f}"
                               f"{f' (情绪{adj:+.3f})' if abs(adj) > 0.01 else ''}"
@@ -785,7 +823,7 @@ def run_post_market(market, sentiment=False):
             if len([s for s in cross_section_raw if s is not None]) > 3:
                 from finbert_sentiment import sentiment_boost_v2
                 print("  📐 应用横截面情绪去偏(z-score标准化)...")
-                for idx, p in enumerate(predictions):
+                for idx, p in enumerate(unadjusted_predictions):
                     t = p["ticker"]
                     sf = sentiment_factors.get(t, {})
                     if sf and sf.get("news_count", 0) > 0:
@@ -820,6 +858,8 @@ def run_post_market(market, sentiment=False):
             print(f"  ⚠️  finbert_sentiment.py 未找到，跳过情绪融合")
         except Exception as e:
             print(f"  ⚠️  情绪融合异常: {e}")
+    elif sentiment and predictions:
+        print("  ℹ️ 预测分数已在开市前完成情绪融合，收市复盘跳过重复应用")
 
     # 输出最终摘要
     print(f"\n  {'='*60}")
@@ -829,6 +869,11 @@ def run_post_market(market, sentiment=False):
     print(f"  日期: {today}")
     print(f"  方向预测准确率: {accuracy:.1%} ({sum(1 for c in compare if c['correct'])}/{len(compare)})")
     print(f"  评分-涨跌幅秩相关: {score_chg_corr:+.3f}")
+    if benchmark_summary["status"] == "ok":
+        print(f"  基准({benchmark_summary['ticker']}) 5日收益: {benchmark_summary['benchmark_return_5d']:+.2f}% | "
+              f"平均超额收益: {benchmark_summary['mean_alpha_5d']:+.2f}%")
+    else:
+        print(f"  基准({benchmark_summary['ticker']}) 数据不可用，未进行 beta/alpha 归因")
     if bias:
         print(f"  方向偏差: {bias}")
     if suggestions:
