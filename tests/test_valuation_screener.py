@@ -35,6 +35,37 @@ def test_dcf_is_finite_and_growth_bounded():
     assert _dcf_per_share(2.0, 0.10, 0.02, 0.02) is None
     assert _dcf_per_share(2.0, 0.10, 0.10, 0.02, net_debt_ps=5.0) < value
     assert _dcf_per_share(2.0, 0.10, 0.10, 0.02, dilution_rate=0.10) < value
+    assert _dcf_per_share(2.0, 0.10, 0.10, 0.02, net_debt_ps=5.0, cash_flow_type="fcfe") > _dcf_per_share(2.0, 0.10, 0.10, 0.02, net_debt_ps=5.0, cash_flow_type="fcff")
+
+
+def test_normalized_fcf_uses_median_and_fallback():
+    import pandas as pd
+
+    cashflow = pd.DataFrame([[100.0, 120.0, 80.0]], index=["Free Cash Flow"], columns=["a", "b", "c"])
+    value, source = valuation._normalized_fcf_per_share(cashflow, 999.0, 10.0)
+    assert value == 10.0
+    assert source == "annual_median"
+    value, source = valuation._normalized_fcf_per_share(None, 50.0, 10.0)
+    assert value == 5.0
+    assert source == "latest"
+    negative = pd.DataFrame([[-100.0, -120.0]], index=["Free Cash Flow"])
+    value, source = valuation._normalized_fcf_per_share(50.0, 50.0, 10.0)
+    assert value == 5.0 and source == "latest"
+    value, source = valuation._normalized_fcf_per_share(negative, 50.0, 10.0)
+    assert value is None and source == "annual_median_nonpositive"
+    assert valuation._growth_percent(0.055) == 5.5
+    assert valuation._growth_percent(5.5) == 5.5
+    assert valuation._growth_percent(150) is None
+
+
+def test_missing_methods_do_not_reduce_to_neutral_weight():
+    records = [_record("AAA", 15, 20, 2.0), _record("BBB", 30, 25, 2.0), _record("CCC", 45, 30, 2.0)]
+    for record in records:
+        record["graham_discount"] = None
+        record["peg"] = None
+    result = compute_valuation_scores(records)
+    assert all(record["valuation_confidence"] < 1 for record in result)
+    assert all("method_agreement" in record and "data_freshness_status" in record for record in result)
 
 
 def test_valuation_requires_absolute_margin_and_quality():

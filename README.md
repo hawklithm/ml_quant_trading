@@ -117,3 +117,12 @@ python scripts/reconcile_paper.py --db live_trading.db \
 
 报告包含生成时间、配置 SHA-256、成本模型、样本量和基准指标。Yahoo/AkShare
 等外部数据源不可用时，必须使用已落盘的历史 CSV；禁止用当前数据替代历史数据。
+\n## Free Data Providers for Valuation
+
+`valuation_screener.py` uses the free provider stack by default and no longer calls Yahoo Finance:
+
+- US fundamentals: SEC EDGAR XBRL (`data.sec.gov`); set `SEC_USER_AGENT` to a descriptive contact string.
+- HK prices: the existing Tencent/Sina adapter.
+- HK fundamentals: optional `akshare.stock_hk_financial_indicator_em`; install with `pip install akshare` when HK valuation data is needed.
+
+Run `python valuation_screener.py --market US --force-refresh` or `python valuation_screener.py --market HK --force-refresh`. Provider failures are recorded per ticker and cached records include `source`, `period_end`, `filed_at`, and PIT status.
