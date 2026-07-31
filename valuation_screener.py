@@ -153,10 +153,32 @@ def fetch_fundamentals(tickers, force_refresh=False, market="US"):
     for i, t in enumerate(tickers):
         sys.stdout.write(f"\r  [{i+1}/{total}] {t:<12} ... ")
         sys.stdout.flush()
+
+        # 指数退避重试
+        max_retries = 3
+        info = None
+        for attempt in range(max_retries):
+            try:
+                import yfinance as yf
+                if attempt > 0:
+                    backoff = (2 ** attempt) * 2.0
+                    sys.stdout.write(f"  等待{backoff:.0f}s重试... ")
+                    sys.stdout.flush()
+                    time.sleep(backoff)
+                info = yf.Ticker(t).info
+                if info and info.get("regularMarketPrice") is not None:
+                    break
+            except Exception as e:
+                last_error = str(e)
+                if attempt < max_retries - 1:
+                    continue
+                errors.append({"ticker": t, "status": "error", "reason": last_error, "data_asof": datetime.now().isoformat(), "market": market})
+                print(f"✗ {last_error}")
+                info = None
+                break
+
         try:
-            import yfinance as yf
-            info = yf.Ticker(t).info
-            if not info or info.get("regularMarketPrice") is None:
+            if info is None or info.get("regularMarketPrice") is None:
                 print("无价格数据")
                 continue
 
@@ -282,9 +304,9 @@ def fetch_fundamentals(tickers, force_refresh=False, market="US"):
             errors.append({"ticker": t, "status": "error", "reason": str(e), "data_asof": datetime.now().isoformat(), "market": market})
             print(f"✗ {e}")
 
-        # 防限流
+        # 防限流：港股限流更严，加大间隔
         if i < total - 1:
-            time.sleep(0.3)
+            time.sleep(1.0 if market == "HK" else 0.5)
 
     _write_fundamentals_cache(market, results, errors)
     fetch_fundamentals.last_errors = errors
@@ -425,7 +447,7 @@ def compute_valuation_scores(records, market="US"):
         r["eligible"] = bool(
             r["valuation_coverage"] >= 2
             and r["average_discount"] is not None
-            and r["average_discount"] >= 10
+            and 10 <= r["average_discount"] <= 50
             and r["quality_pass"]
             and r["hard_valuation_pass"]
         )
