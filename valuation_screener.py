@@ -603,7 +603,7 @@ if __name__ == "__main__":
     label = "港股" if args.market == "HK" else "美股"
 
     print(f"📊 {label}估值分析 — {len(tickers)} 只标的")
-    assumptions = _market_assumptions(market)
+    assumptions = _market_assumptions(args.market)
     required_return = assumptions["risk_free_rate"] + assumptions["equity_risk_premium"]
     print(f"  请求回报率: {required_return:.0%} = 无风险{assumptions['risk_free_rate']:.1%} + ERP{assumptions['equity_risk_premium']:.1%}")
 
