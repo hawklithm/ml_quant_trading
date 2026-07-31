@@ -184,9 +184,11 @@ def fetch_sina_realtime(tickers):
                 if not ticker:
                     continue
                 
-                # 港股格式: name,price,change,...
+                # 港股格式: name_en, name_cn, open, last_close, price, high, low, change, change_pct, ...
                 if code.startswith('hk'):
-                    price = float(parts[1]) if parts[1] else 0
+                    # market_state: 0=盘中 1=休市 2=收市
+                    market_state = parts[10] if len(parts) > 10 else ''
+                    price = float(parts[4]) if len(parts) > 4 and parts[4] else 0
                     change_pct = parts[2]  # 绝对值
                     open_p = float(parts[5]) if len(parts) > 5 and parts[5] else price
                     high = float(parts[6]) if len(parts) > 6 and parts[6] else price

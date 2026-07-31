@@ -480,7 +480,11 @@ def compute_valuation_scores(records, market="US"):
     for i, r in enumerate(records):
         s = r.get(group_column, r.get("sector", "Other"))
         med_pe = sector_medians.get(s)
-        eps = r.get(eps_column, r.get("eps"))
+        eps = r.get("eps")
+        own_pe = r.get("trailing_pe")
+        price = r.get("price")
+        if price is None or not np.isfinite(price) or price <= 0:
+            continue
         peer_values = df.loc[(df[group_column] == s) & (df.index != i), pe_column].dropna()
         peer_values = peer_values[(peer_values > 0) & (peer_values < 100)]
         peer_median = peer_values.median() if len(peer_values) >= 2 else med_pe
@@ -667,6 +671,8 @@ def print_valuation_report(records, market, top_n=20):
     for i, r in enumerate(records[:top_n]):
         score = r.get("value_score", 0)
         price = r.get("price", 0)
+        if price is None or price <= 0:
+            continue
 
         # 计算平均折价（多方法平均）
         discounts = []
@@ -704,6 +710,8 @@ def print_valuation_report(records, market, top_n=20):
         name = r.get("name", t)
         sector = r.get("sector", "N/A")
         price = r.get("price", 0)
+        if price is None or price <= 0:
+            continue
 
         print(f"\n  ── {t} ({name}) | {sector} | 现价 ${price:.1f} ──")
         print(f"     估值综合分: {r.get('value_score', 0):.0f}/100")
